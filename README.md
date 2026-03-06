@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./codlogs.png" alt="codlogs" width="220">
+  <img src="./codlogs.png" alt="codlogs" width="500">
 </p>
 
 <p align="center">
