@@ -25,7 +25,10 @@ const timestampFormatter = new Intl.DateTimeFormat(undefined, {
   timeStyle: "short",
 });
 
+const RPC_MAX_REQUEST_TIME_MS = 15 * 60 * 1000;
+
 const rpc = Electroview.defineRPC<CodexerRPC>({
+  maxRequestTime: RPC_MAX_REQUEST_TIME_MS,
   handlers: {
     requests: {},
     messages: {},
@@ -33,6 +36,106 @@ const rpc = Electroview.defineRPC<CodexerRPC>({
 });
 
 const electroview = new Electroview({ rpc });
+
+function describeScope(
+  result: FindCodexSessionsResult | null,
+  browseMode: BrowseMode,
+): string {
+  if (!result) {
+    return "Loading";
+  }
+
+  if (browseMode === "all" || result.scopeMode === "all") {
+    return "All sessions";
+  }
+
+  return result.scopeMode === "repo" ? "Repo root" : "Folder tree";
+}
+
+function getSessionTitle(session: SessionMetaMatch): string {
+  const threadName = session.threadName?.trim();
+  if (threadName) {
+    return threadName;
+  }
+
+  return formatDisplayFileName(basename(session.file)).replace(/\.jsonl$/i, "");
+}
+
+function basename(value: string): string {
+  return value.split(/[\\/]/).filter(Boolean).pop() ?? value;
+}
+
+function truncateGuidText(value: string): string {
+  return value
+    .replace(
+      /\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b/g,
+      (guid) => `${guid.slice(0, 10)}...`,
+    )
+    .replace(/\b([0-9a-fA-F]{10})[0-9a-fA-F]{8,}\b/g, "$1...");
+}
+
+function formatDisplayFileName(fileName: string): string {
+  const extensionMatch = fileName.match(/(\.[^.]+)$/);
+  const extension = extensionMatch?.[1] ?? "";
+  const stem = extension ? fileName.slice(0, -extension.length) : fileName;
+  return `${truncateGuidText(stem)}${extension}`;
+}
+
+function formatDisplayPath(value: string): string {
+  const lastSeparatorIndex = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+  if (lastSeparatorIndex < 0) {
+    return formatDisplayFileName(value);
+  }
+
+  return `${value.slice(0, lastSeparatorIndex + 1)}${formatDisplayFileName(value.slice(lastSeparatorIndex + 1))}`;
+}
+
+function formatTimestamp(value: string | null): string {
+  if (!value) {
+    return "Unknown";
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? value : timestampFormatter.format(parsed);
+}
+
+function matchesSearch(session: SessionMetaMatch, query: string): boolean {
+  const trimmedQuery = query.trim().toLowerCase();
+  if (!trimmedQuery) {
+    return true;
+  }
+
+  const threadName = session.threadName ?? "";
+  const folderName = basename(session.cwd);
+
+  return [
+    threadName,
+    folderName,
+    session.kind,
+  ].some((field) => field.toLowerCase().includes(trimmedQuery));
+}
+
+function asErrorMessage(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
+}
+
+function getRequestedFolderTarget(folderPath: string): string {
+  return folderPath.trim() || "";
+}
+
+function getRpc() {
+  if (!electroview.rpc) {
+    throw new Error("Electroview RPC is not available.");
+  }
+
+  return electroview.rpc;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
 
 function App() {
   const [result, setResult] = useState<FindCodexSessionsResult | null>(null);
@@ -58,8 +161,11 @@ function App() {
   const codexHomeRef = useRef(codexHome);
   const folderPathRef = useRef(folderPath);
   const loadRequestIdRef = useRef(0);
+  const exportRequestIdRef = useRef(0);
+  const initialWindowRefreshDoneRef = useRef(false);
 
   const deferredSearchQuery = useDeferredValue(searchQuery);
+  const deferredFolderPath = useDeferredValue(folderPath);
 
   useEffect(() => {
     void loadSessions("", "folder");
@@ -134,6 +240,10 @@ function App() {
           ? current
           : nextResult.sessions[0]?.file ?? null,
       );
+      if (!initialWindowRefreshDoneRef.current) {
+        initialWindowRefreshDoneRef.current = true;
+        void getRpc().request.refreshWindowLayout({});
+      }
     } catch (loadError) {
       if (requestId !== loadRequestIdRef.current) {
         return;
@@ -165,29 +275,99 @@ function App() {
   }
 
   async function exportActiveSessionMarkdown(): Promise<void> {
+    await exportActiveSession("markdown");
+  }
+
+  async function exportActiveSessionHtml(): Promise<void> {
+    await exportActiveSession("html");
+  }
+
+  async function exportActiveSession(format: "markdown" | "html"): Promise<void> {
     if (!activeSession) {
       return;
     }
 
+    const exportRequestId = exportRequestIdRef.current + 1;
+    exportRequestIdRef.current = exportRequestId;
+    let outputDirectory: string | null = null;
+
+    try {
+      const response = await getRpc().request.pickExportDirectory({
+        sessionFilePath: activeSession.file,
+      });
+      outputDirectory = response.path;
+    } catch (pickError) {
+      setExportState({
+        kind: "error",
+        message: asErrorMessage(pickError),
+        outputPath: null,
+      });
+      return;
+    }
+
+    if (!outputDirectory) {
+      setExportState({
+        kind: "idle",
+        message: "Export cancelled.",
+        outputPath: null,
+      });
+      return;
+    }
+
+    const label = format === "markdown" ? "Markdown" : "HTML";
+
     setExportState({
       kind: "working",
-      message: "Creating Markdown export...",
+      message: `Creating ${label} export...`,
       outputPath: null,
     });
 
     try {
-      const { outputPath } = await getRpc().request.exportSessionMarkdown({
+      if (format === "markdown") {
+        const { outputPath } = await getRpc().request.exportSessionMarkdown({
+          sessionFilePath: activeSession.file,
+          includeImages: exportImages,
+          includeToolCallResults: exportToolCallResults,
+          outputDirectory,
+        });
+
+        if (exportRequestId !== exportRequestIdRef.current) {
+          return;
+        }
+
+        setExportState({
+          kind: "success",
+          message: `${label} written to ${outputPath}`,
+          outputPath,
+        });
+        return;
+      }
+
+      const { jobId } = await getRpc().request.startSessionHtmlExport({
         sessionFilePath: activeSession.file,
         includeImages: exportImages,
         includeToolCallResults: exportToolCallResults,
+        outputDirectory,
       });
 
-      setExportState({
-        kind: "success",
-        message: `Markdown written to ${outputPath}`,
-        outputPath,
-      });
+      while (exportRequestId === exportRequestIdRef.current) {
+        const status = await getRpc().request.getExportJobStatus({ jobId });
+        if (exportRequestId !== exportRequestIdRef.current) {
+          return;
+        }
+
+        setExportState(status);
+        if (status.kind !== "working") {
+          return;
+        }
+
+        await delay(400);
+      }
     } catch (exportError) {
+      if (exportRequestId !== exportRequestIdRef.current) {
+        return;
+      }
+
       setExportState({
         kind: "error",
         message: asErrorMessage(exportError),
@@ -228,7 +408,7 @@ function App() {
   }
 
   function handleFilterByFolder(): void {
-    void loadSessions(getRequestedFolderTarget(folderPath), "folder", cwdOnly);
+    void loadSessions(getRequestedFolderTarget(deferredFolderPath), "folder", cwdOnly);
   }
 
   function handleRefresh(): void {
@@ -245,44 +425,31 @@ function App() {
       <div className="ambient ambient-b" />
       <main className="workspace">
         <header className="hero">
-          <div>
-            <p className="eyebrow">Electrobun session browser</p>
+          <div className="hero-content">
             <h1>codexer</h1>
             <p className="hero-copy">
-              Browse Codex sessions, filter to a repo or folder, and export any
-              session JSONL as Markdown.
+              Browse and export your Codex sessions with ease.
             </p>
           </div>
           <div className="hero-stats">
             <div className="stat-card">
-              <span className="stat-label">Loaded</span>
-              <strong>{result?.sessionCount ?? 0}</strong>
-              <span>{result ? `${result.liveCount} live / ${result.archivedCount} archived` : "Waiting for scan"}</span>
+              <span className="stat-label">Sessions</span>
+              <span className="stat-value">{result?.sessionCount ?? 0}</span>
+              <span className="stat-detail">{result ? `${result.liveCount} live / ${result.archivedCount} archived` : "Scanning..."}</span>
             </div>
             <div className="stat-card">
               <span className="stat-label">Scope</span>
-              <strong>{describeScope(result, appliedQuery.browseMode)}</strong>
-              <span
-                className="stat-detail"
-                title={result?.targetRoot ?? "All Codex sessions"}
-              >
-                {result?.targetRoot ?? "All Codex sessions"}
+              <span className="stat-value">{describeScope(result, appliedQuery.browseMode)}</span>
+              <span className="stat-detail" title={result?.targetRoot ?? "All sessions"}>
+                {result?.targetRoot ?? "All sessions"}
               </span>
             </div>
           </div>
         </header>
 
         <section className="control-strip">
-          <div className="value-field">
-            <span>Codex home</span>
-            <div className="value-chip mono">{codexHome || "Loading..."}</div>
-          </div>
-          <button className="ghost-button" onClick={handleRefresh}>
-            Refresh
-          </button>
-
-          <label className="field field-wide">
-            <span>Folder filter</span>
+          <div className="search-container">
+            <span className="search-icon">🔍</span>
             <input
               value={folderPath}
               onChange={(event) => setFolderPath(event.target.value)}
@@ -292,126 +459,127 @@ function App() {
                   handleFilterByFolder();
                 }
               }}
-              placeholder="Optional repo or folder"
+              placeholder="Filter by folder or repo path..."
             />
-          </label>
-          <button className="ghost-button" onClick={() => void pickFolder()}>
-            Choose folder…
-          </button>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={cwdOnly}
-              onChange={(event) => setCwdOnly(event.target.checked)}
-            />
-            <span>Match only this folder tree</span>
-          </label>
-          <button className="ghost-button" onClick={handleLoadAll}>
-            All sessions
-          </button>
-          <button className="primary-button" onClick={handleFilterByFolder}>
-            Filter by folder
-          </button>
+          </div>
+          <div className="filter-actions">
+            <button className="ghost-button" onClick={() => void pickFolder()}>
+              Choose Folder
+            </button>
+            <button className="ghost-button" onClick={handleRefresh}>
+              Refresh
+            </button>
+            <button className="primary-button" onClick={handleFilterByFolder}>
+              Filter
+            </button>
+            <button className="primary-button" onClick={handleLoadAll}>
+              Show All
+            </button>
+          </div>
         </section>
 
         <section className="content-grid">
-          <aside className="panel session-panel">
+          <aside className="panel">
             <div className="panel-header">
-              <div>
-                <p className="eyebrow">Session index</p>
-                <h2>Recent matches</h2>
+              <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+                <h2>Sessions</h2>
+                <span style={{ fontSize: "0.85rem", color: "var(--color-text-muted)" }}>
+                  {filteredSessions.length} {filteredSessions.length === 1 ? "match" : "matches"}
+                </span>
               </div>
-              <label className="field compact-field">
-                <span>Search</span>
+              <div className="search-container compact" style={{ height: "2.2rem", flex: "0 0 150px" }}>
                 <input
                   value={searchQuery}
                   onChange={(event) => {
-                    startTransition(() => {
-                      setSearchQuery(event.target.value);
-                    });
+                    setSearchQuery(event.target.value);
                   }}
-                  placeholder="Thread, cwd, file, id"
+                  placeholder="Search..."
+                  style={{ fontSize: "0.85rem" }}
                 />
-              </label>
-            </div>
-
-            <div className="results-meta">
-              <span>{filteredSessions.length} visible</span>
-              <span>{loading ? "Scanning…" : "Sorted newest first"}</span>
-            </div>
-
-            {loading ? (
-              <div className="empty-state">Scanning Codex session metadata…</div>
-            ) : filteredSessions.length === 0 ? (
-              <div className="empty-state">
-                {error ?? "No sessions match the current filter."}
               </div>
-            ) : (
-              <div className="session-list">
-                {filteredSessions.map((session) => (
+            </div>
+
+            <div className="session-list">
+              {loading ? (
+                <div className="empty-state">
+                  <span className="empty-icon">📂</span>
+                  <p>Scanning Codex sessions...</p>
+                </div>
+              ) : filteredSessions.length === 0 ? (
+                <div className="empty-state">
+                  <span className="empty-icon">❓</span>
+                  <p>{error ?? "No sessions found."}</p>
+                </div>
+              ) : (
+                filteredSessions.map((session) => (
                   <button
                     key={session.file}
-                    className={session.file === activeSession?.file ? "session-card selected" : "session-card"}
+                    className={`session-card ${session.file === activeSession?.file ? "selected" : ""}`}
                     onClick={() => setSelectedFile(session.file)}
                   >
-                    <div className="session-card-top">
-                      <span className={`kind-pill kind-${session.kind}`}>{session.kind}</span>
-                      <span>{formatTimestamp(session.updatedAt ?? session.startedAt)}</span>
+                    <div className="session-card-header">
+                      <span className={`kind-badge kind-${session.kind}`}>{session.kind}</span>
+                      <span className="session-time">{formatTimestamp(session.updatedAt ?? session.startedAt)}</span>
                     </div>
-                    <strong>{getSessionTitle(session)}</strong>
-                    <span className="session-path">{session.cwd}</span>
-                    <span className="session-file">{session.file}</span>
+                    <span className="session-title">{getSessionTitle(session)}</span>
+                    <span className="session-cwd">{session.cwd}</span>
                   </button>
-                ))}
-              </div>
-            )}
+                ))
+              )}
+            </div>
           </aside>
 
-          <section className="panel detail-panel">
+          <section className="panel">
             {activeSession ? (
-              <>
-                <div className="panel-header">
-                  <div>
-                    <p className="eyebrow">Selected session</p>
+              <div className="detail-content">
+                <div className="detail-header">
+                  <div className="detail-title">
                     <h2>{getSessionTitle(activeSession)}</h2>
                   </div>
-                  <div className="detail-actions">
+                  <div className="filter-actions">
                     <button className="ghost-button" onClick={() => void revealPath(activeSession.file)}>
                       Reveal JSONL
                     </button>
                     <button className="primary-button" onClick={() => void exportActiveSessionMarkdown()}>
-                      Export .md
+                      Export Markdown
+                    </button>
+                    <button className="primary-button" onClick={() => void exportActiveSessionHtml()}>
+                      Export HTML
                     </button>
                   </div>
                 </div>
 
-                <dl className="meta-grid">
-                  <MetaRow label="Updated" value={formatTimestamp(activeSession.updatedAt)} />
-                  <MetaRow label="Started" value={formatTimestamp(activeSession.startedAt)} />
-                  <MetaRow label="Kind" value={activeSession.kind} />
-                  <MetaRow label="Session ID" value={activeSession.id} mono />
-                  <MetaRow label="CWD" value={activeSession.cwd} mono />
-                  <MetaRow label="JSONL file" value={activeSession.file} mono />
-                </dl>
+                <div className="detail-meta-grid">
+                  <div className="meta-item">
+                    <span className="meta-label">Timeline</span>
+                    <div className="meta-value">
+                      <div style={{ marginBottom: "0.4rem" }}>
+                        <span style={{ fontSize: "0.7rem", color: "var(--color-accent)", marginRight: "0.5rem" }}>UPDATED</span>
+                        {formatTimestamp(activeSession.updatedAt)}
+                      </div>
+                      <div>
+                        <span style={{ fontSize: "0.7rem", color: "var(--color-accent)", marginRight: "0.5rem" }}>STARTED</span>
+                        {formatTimestamp(activeSession.startedAt)}
+                      </div>
+                    </div>
+                  </div>
+                  <MetaItem label="Session ID" value={activeSession.id} />
+                  <MetaItem label="Working Directory" value={activeSession.cwd} />
+                  <MetaItem label="Source File" value={formatDisplayPath(activeSession.file)} />
+                </div>
 
-                <section className="note-card">
-                  <h3>Markdown export</h3>
-                  <p>
-                    The export lands right beside the JSONL file and keeps the same
-                    basename, so <code>.jsonl</code> becomes <code>.md</code>. If image
-                    export is enabled, screenshots are written into a sibling
-                    <code>.assets</code> folder and linked from the Markdown.
-                  </p>
+                <div className="export-section">
+                  <h3>Export Options</h3>
                   <div className="export-options">
-                    <label className="toggle export-toggle">
+                    <label className="checkbox-label">
                       <input
                         type="checkbox"
                         checked={exportImages}
                         onChange={(event) => setExportImages(event.target.checked)}
                       />
-                      <span>Include images</span>
+                      <span>Include captured images</span>
                     </label>
-                    <label className="toggle export-toggle">
+                    <label className="checkbox-label">
                       <input
                         type="checkbox"
                         checked={exportToolCallResults}
@@ -420,45 +588,35 @@ function App() {
                       <span>Include tool calls and results</span>
                     </label>
                   </div>
-                </section>
 
-                <section className={`status-card status-${exportState.kind}`}>
-                  <div>
-                    <p className="eyebrow">Export status</p>
-                    <strong>
-                      {exportState.kind === "idle"
-                        ? "Ready"
-                        : exportState.kind === "working"
-                          ? "Working"
-                          : exportState.kind === "success"
-                            ? "Complete"
-                            : "Needs attention"}
-                    </strong>
-                    <p>{exportState.message || "Pick any session and create a Markdown transcript export."}</p>
+                  <div className={`status-banner status-${exportState.kind}`}>
+                    <div className="status-info">
+                      <strong>
+                        {exportState.kind === "idle" ? "Ready to export" :
+                         exportState.kind === "working" ? "Exporting..." :
+                         exportState.kind === "success" ? "Export complete" : "Export failed"}
+                      </strong>
+                      <p>{exportState.message || "Select options and click Export Markdown or Export HTML to begin."}</p>
+                    </div>
+                    {exportState.outputPath && (
+                      <div className="filter-actions">
+                        <button className="ghost-button" onClick={() => void revealPath(exportState.outputPath)}>
+                          Reveal
+                        </button>
+                        <button className="ghost-button" onClick={() => void openPath(exportState.outputPath)}>
+                          Open
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <div className="detail-actions">
-                    <button
-                      className="ghost-button"
-                      disabled={!exportState.outputPath}
-                      onClick={() => void revealPath(exportState.outputPath)}
-                    >
-                      Reveal Markdown
-                    </button>
-                    <button
-                      className="ghost-button"
-                      disabled={!exportState.outputPath}
-                      onClick={() => void openPath(exportState.outputPath)}
-                    >
-                      Open Markdown
-                    </button>
-                  </div>
-                </section>
+                </div>
 
-                {error ? <div className="inline-error">{error}</div> : null}
-              </>
+                {error && <div className="inline-error" style={{ marginTop: "1rem" }}>{error}</div>}
+              </div>
             ) : (
-              <div className="empty-state detail-empty">
-                {error ?? "Select a session to inspect it and export a Markdown transcript."}
+              <div className="empty-state">
+                <span className="empty-icon">📝</span>
+                <p>{error ?? "Select a session to view details and export."}</p>
               </div>
             )}
           </section>
@@ -468,89 +626,13 @@ function App() {
   );
 }
 
-function MetaRow({
-  label,
-  value,
-  mono,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-}) {
+function MetaItem({ label, value }: { label: string; value: string }) {
   return (
-    <div className="meta-row">
-      <dt>{label}</dt>
-      <dd className={mono ? "mono" : undefined}>{value}</dd>
+    <div className="meta-item">
+      <span className="meta-label">{label}</span>
+      <span className="meta-value">{value}</span>
     </div>
   );
-}
-
-function describeScope(
-  result: FindCodexSessionsResult | null,
-  browseMode: BrowseMode,
-): string {
-  if (!result) {
-    return "Loading";
-  }
-
-  if (browseMode === "all" || result.scopeMode === "all") {
-    return "All sessions";
-  }
-
-  return result.scopeMode === "repo" ? "Repo root" : "Folder tree";
-}
-
-function getSessionTitle(session: SessionMetaMatch): string {
-  const threadName = session.threadName?.trim();
-  if (threadName) {
-    return threadName;
-  }
-
-  return basename(session.file).replace(/\.jsonl$/i, "");
-}
-
-function basename(value: string): string {
-  return value.split(/[\\/]/).filter(Boolean).pop() ?? value;
-}
-
-function formatTimestamp(value: string | null): string {
-  if (!value) {
-    return "Unknown";
-  }
-
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? value : timestampFormatter.format(parsed);
-}
-
-function matchesSearch(session: SessionMetaMatch, query: string): boolean {
-  const trimmedQuery = query.trim().toLowerCase();
-  if (!trimmedQuery) {
-    return true;
-  }
-
-  return [
-    session.threadName ?? "",
-    session.cwd,
-    session.file,
-    session.id,
-    session.kind,
-  ].some((field) => field.toLowerCase().includes(trimmedQuery));
-}
-
-function asErrorMessage(value: unknown): string {
-  return value instanceof Error ? value.message : String(value);
-}
-
-function getRequestedFolderTarget(folderPath: string): string {
-  return folderPath.trim() || "";
-}
-
-function getRpc() {
-  if (!electroview.rpc) {
-    throw new Error("Electroview RPC is not available.");
-  }
-
-  return electroview.rpc;
 }
 
 export default App;

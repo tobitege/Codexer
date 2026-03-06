@@ -44,6 +44,13 @@ export type FindCodexSessionsResult = {
 export type MarkdownExportOptions = {
   includeImages?: boolean;
   includeToolCallResults?: boolean;
+  outputDirectory?: string | null;
+};
+
+export type HtmlExportOptions = {
+  includeImages?: boolean;
+  includeToolCallResults?: boolean;
+  outputDirectory?: string | null;
 };
 
 type SessionIndexRecord = {
@@ -92,7 +99,17 @@ type NormalizedMarkdownExportOptions = {
   includeToolCallResults: boolean;
 };
 
+type NormalizedHtmlExportOptions = {
+  includeImages: boolean;
+  includeToolCallResults: boolean;
+};
+
 type MarkdownImageAsset = {
+  fileName: string;
+  data: Uint8Array;
+};
+
+type HtmlImageAsset = {
   fileName: string;
   data: Uint8Array;
 };
@@ -102,6 +119,13 @@ type MarkdownRenderContext = {
   assets: MarkdownImageAsset[];
   nextImageIndex: number;
   options: NormalizedMarkdownExportOptions;
+};
+
+type HtmlRenderContext = {
+  assetDirectoryName: string;
+  assets: HtmlImageAsset[];
+  nextImageIndex: number;
+  options: NormalizedHtmlExportOptions;
 };
 
 type RenderedMessageContent = {
@@ -228,6 +252,10 @@ export async function exportSessionJsonlToMarkdown(
   const records = parseJsonlRecords(content);
   const normalizedOptions = normalizeMarkdownExportOptions(options);
   const outputName = path.parse(sessionFilePath).name;
+  const outputDirectory = normalizeOptionalPathInput(options.outputDirectory);
+  const outputDirectoryPath = outputDirectory
+    ? resolveFilesystemPath(outputDirectory)
+    : path.dirname(sessionFilePath);
   const assetDirectoryName = `${outputName}.assets`;
   const { markdown, assets } = buildMarkdownExport(
     sessionFilePath,
@@ -235,14 +263,60 @@ export async function exportSessionJsonlToMarkdown(
     normalizedOptions,
     assetDirectoryName,
   );
-  const outputPath = path.join(
-    path.dirname(sessionFilePath),
-    `${outputName}.md`,
-  );
+  await fs.mkdir(outputDirectoryPath, { recursive: true });
+  const outputPath = path.join(outputDirectoryPath, `${outputName}.md`);
   await fs.writeFile(outputPath, markdown, "utf8");
 
   if (assets.length > 0) {
-    const assetDirectoryPath = path.join(path.dirname(sessionFilePath), assetDirectoryName);
+    const assetDirectoryPath = path.join(outputDirectoryPath, assetDirectoryName);
+    await fs.mkdir(assetDirectoryPath, { recursive: true });
+    await Promise.all(
+      assets.map((asset) =>
+        fs.writeFile(path.join(assetDirectoryPath, asset.fileName), asset.data),
+      ),
+    );
+  }
+
+  return outputPath;
+}
+
+export async function exportSessionJsonlToHtml(
+  inputPath: string,
+  options: HtmlExportOptions = {},
+): Promise<string> {
+  const sessionFilePath = resolveFilesystemPath(inputPath);
+  if (!(await pathExists(sessionFilePath))) {
+    throw new Error(`Session file not found: ${sessionFilePath}`);
+  }
+
+  if (path.extname(sessionFilePath).toLowerCase() !== ".jsonl") {
+    throw new Error(`Expected a .jsonl file: ${sessionFilePath}`);
+  }
+
+  const content = await fs.readFile(sessionFilePath, "utf8");
+  const records = parseJsonlRecords(content);
+  const normalizedOptions = normalizeHtmlExportOptions(options);
+  const outputName = path.parse(sessionFilePath).name;
+  const outputDirectory = normalizeOptionalPathInput(options.outputDirectory);
+  const outputDirectoryPath = outputDirectory
+    ? resolveFilesystemPath(outputDirectory)
+    : path.dirname(sessionFilePath);
+  const assetDirectoryName = `${outputName}.assets`;
+
+  // Process buildHtmlExport in a way that doesn't block the event loop
+  const { html, assets } = buildHtmlExport(
+    sessionFilePath,
+    records,
+    normalizedOptions,
+    assetDirectoryName,
+  );
+  
+  await fs.mkdir(outputDirectoryPath, { recursive: true });
+  const outputPath = path.join(outputDirectoryPath, `${outputName}.html`);
+  await fs.writeFile(outputPath, html, "utf8");
+
+  if (assets.length > 0) {
+    const assetDirectoryPath = path.join(outputDirectoryPath, assetDirectoryName);
     await fs.mkdir(assetDirectoryPath, { recursive: true });
     await Promise.all(
       assets.map((asset) =>
@@ -257,6 +331,15 @@ export async function exportSessionJsonlToMarkdown(
 function normalizeMarkdownExportOptions(
   options: MarkdownExportOptions,
 ): NormalizedMarkdownExportOptions {
+  return {
+    includeImages: options.includeImages === true,
+    includeToolCallResults: options.includeToolCallResults === true,
+  };
+}
+
+function normalizeHtmlExportOptions(
+  options: HtmlExportOptions,
+): NormalizedHtmlExportOptions {
   return {
     includeImages: options.includeImages === true,
     includeToolCallResults: options.includeToolCallResults === true,
@@ -712,6 +795,496 @@ function looksLikeJsonStructuredText(value: string): boolean {
   );
 }
 
+function buildHtmlExport(
+  sessionFilePath: string,
+  records: JsonlRecord[],
+  options: NormalizedHtmlExportOptions,
+  assetDirectoryName: string,
+): { html: string; assets: HtmlImageAsset[] } {
+  const sessionMeta = findSessionExportMetadata(records);
+  if (!sessionMeta) {
+    throw new Error(`No session_meta record found in ${sessionFilePath}`);
+  }
+
+  const transcriptSections: string[] = [];
+  let omittedBootstrapMessages = 0;
+  const renderContext: HtmlRenderContext = {
+    assetDirectoryName,
+    assets: [],
+    nextImageIndex: 1,
+    options,
+  };
+
+  for (const record of records) {
+    if (record.type !== "response_item") {
+      continue;
+    }
+
+    const item = asObject(record.payload);
+    if (!item || typeof item.type !== "string") {
+      continue;
+    }
+
+    const rendered =
+      item.type === "message"
+        ? renderHtmlMessageEntry(record, item, renderContext)
+        : options.includeToolCallResults && item.type === "function_call"
+          ? renderHtmlToolCallEntry(record, item, "Tool Call")
+          : options.includeToolCallResults && item.type === "function_call_output"
+            ? renderHtmlToolOutputEntry(record, item, "Tool Output")
+            : options.includeToolCallResults && item.type === "custom_tool_call"
+              ? renderHtmlCustomToolCallEntry(record, item)
+              : options.includeToolCallResults && item.type === "custom_tool_call_output"
+                ? renderHtmlCustomToolOutputEntry(record, item)
+                : item.type === "reasoning"
+                  ? renderHtmlReasoningEntry(record, item)
+                  : null;
+
+    if (rendered === "bootstrap-omitted") {
+      omittedBootstrapMessages += 1;
+      continue;
+    }
+
+    if (rendered) {
+      transcriptSections.push(numberMarkdownTranscriptEntry(rendered, transcriptSections.length + 1));
+    }
+  }
+
+  const title = sessionMeta.id;
+  const styles = `
+    :root {
+      --bg: #f8f9fa;
+      --text: #212529;
+      --muted: #6c757d;
+      --accent: #0d6efd;
+      --user-bg: #e7f3ff;
+      --assistant-bg: #ffffff;
+      --border: #dee2e6;
+      --shadow: 0 2px 4px rgba(0,0,0,0.05);
+      --pre-bg: #f8f9fa;
+    }
+    html.dark {
+      --bg: #212529;
+      --text: #f8f9fa;
+      --muted: #adb5bd;
+      --accent: #3793ff;
+      --user-bg: #2b3035;
+      --assistant-bg: #343a40;
+      --border: #495057;
+      --shadow: 0 2px 4px rgba(0,0,0,0.3);
+      --pre-bg: #1a1d20;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.5;
+      color: var(--text);
+      background: var(--bg);
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem 1rem;
+      transition: background 0.2s, color 0.2s;
+    }
+    header {
+      margin-bottom: 3rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+    .theme-toggle {
+      position: absolute;
+      top: 0;
+      right: 0;
+      padding: 0.5rem;
+      cursor: pointer;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 0.25rem;
+      color: var(--text);
+      font-size: 0.8rem;
+    }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 1rem;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .meta-item b { color: var(--text); }
+    .transcript {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      counter-reset: bubble;
+    }
+    .bubble {
+      counter-increment: bubble;
+      max-width: 85%;
+      padding: 1rem 1.25rem;
+      border-radius: 1.25rem;
+      box-shadow: var(--shadow);
+      position: relative;
+    }
+    .bubble::before {
+      content: "#" counter(bubble);
+      position: absolute;
+      top: -0.75rem;
+      left: 1rem;
+      padding: 0.15rem 0.45rem;
+      border-radius: 999px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .bubble-user {
+      align-self: flex-end;
+      background: var(--user-bg);
+      border-bottom-right-radius: 0.25rem;
+    }
+    .bubble-assistant {
+      align-self: flex-start;
+      background: var(--assistant-bg);
+      border-bottom-left-radius: 0.25rem;
+      border: 1px solid var(--border);
+    }
+    .bubble-tool {
+      align-self: center;
+      background: var(--pre-bg);
+      border: 1px dashed var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.85rem;
+      max-width: 95%;
+    }
+    .bubble-reasoning {
+      align-self: flex-start;
+      background: rgba(255, 249, 219, 0.1);
+      border: 1px solid #ffe066;
+      font-style: italic;
+      font-size: 0.9rem;
+    }
+    .bubble-header {
+      font-size: 0.75rem;
+      font-weight: bold;
+      text-transform: uppercase;
+      margin-bottom: 0.5rem;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+    }
+    .bubble-content {
+      word-break: break-word;
+    }
+    pre {
+      background: var(--pre-bg);
+      padding: 1rem;
+      border-radius: 0.5rem;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.9em;
+    }
+    img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 0.5rem;
+      margin: 0.5rem 0;
+    }
+  `;
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex Session - ${title}</title>
+  <style>${styles}</style>
+  <script>
+    function toggleTheme() {
+      const isDark = document.documentElement.classList.toggle("dark");
+      localStorage.setItem("theme", isDark ? "dark" : "light");
+    }
+    if (localStorage.getItem("theme") === "dark" || (!localStorage.getItem("theme") && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+      document.documentElement.classList.add("dark");
+    }
+  </script>
+</head>
+<body>
+  <header>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓 Theme</button>
+    <h1>Codex Session Export</h1>
+    <div class="meta-grid">
+      <div class="meta-item"><b>ID:</b> ${sessionMeta.id}</div>
+      <div class="meta-item"><b>Started:</b> ${sessionMeta.startedAt ?? "unknown"}</div>
+      <div class="meta-item"><b>CWD:</b> ${sessionMeta.cwd}</div>
+      <div class="meta-item"><b>Originator:</b> ${sessionMeta.originator ?? "unknown"}</div>
+      <div class="meta-item"><b>CLI:</b> ${sessionMeta.cliVersion ?? "unknown"}</div>
+      <div class="meta-item"><b>Source:</b> ${sessionMeta.source ?? "unknown"}</div>
+      <div class="meta-item"><b>Model:</b> ${sessionMeta.modelProvider ?? "unknown"}</div>
+      <div class="meta-item"><b>Exported:</b> ${new Date().toISOString()}</div>
+    </div>
+  </header>
+  <div class="transcript">
+    ${transcriptSections.join("\n")}
+  </div>
+</body>
+</html>`;
+
+  // Use a small delay to prevent blocking the event loop too long for very large sessions
+  // but since we're in a worker-like environment (Bun RPC), the main issue is usually
+  // just the sheer size of the string being passed back.
+  
+  return { html, assets: renderContext.assets };
+}
+
+function renderHtmlMessageEntry(
+  record: JsonlRecord,
+  item: Record<string, unknown>,
+  context: HtmlRenderContext,
+): string | "bootstrap-omitted" | null {
+  const role = typeof item.role === "string" ? item.role : "unknown";
+  if (role === "developer") {
+    return null;
+  }
+
+  const renderedContent = renderHtmlMessageContent(item.content, context);
+  if (!renderedContent.text && renderedContent.imageHtml.length === 0) {
+    return null;
+  }
+
+  if (role === "user" && looksLikeBootstrapContext(renderedContent.text)) {
+    return "bootstrap-omitted";
+  }
+
+  const phase = typeof item.phase === "string" ? ` [${item.phase}]` : "";
+  const timestamp = formatTimestamp(record.timestamp);
+
+  return `
+    <div class="bubble bubble-${role}">
+      <div class="bubble-header">
+        <span>${toTitleCase(role)}${phase}</span>
+        <span>${timestamp}</span>
+      </div>
+      <div class="bubble-content">
+        ${renderedContent.text.split("\n\n").map(p => `<p>${escapeHtml(p)}</p>`).join("")}
+        ${renderedContent.imageHtml.join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderHtmlToolCallEntry(
+  record: JsonlRecord,
+  item: Record<string, unknown>,
+  label: string,
+): string {
+  const toolName = typeof item.name === "string" ? item.name : "unknown-tool";
+  const argumentsText = prettyStructuredText(item.arguments);
+  return `
+    <div class="bubble bubble-tool">
+      <div class="bubble-header">
+        <span>${label}: ${toolName}</span>
+        <span>${formatTimestamp(record.timestamp)}</span>
+      </div>
+      <pre><code>${escapeHtml(argumentsText)}</code></pre>
+    </div>
+  `;
+}
+
+function renderHtmlToolOutputEntry(
+  record: JsonlRecord,
+  item: Record<string, unknown>,
+  label: string,
+): string {
+  const callId = typeof item.call_id === "string" ? ` (${item.call_id})` : "";
+  const outputText = prettyStructuredText(item.output);
+  return `
+    <div class="bubble bubble-tool">
+      <div class="bubble-header">
+        <span>${label}${callId}</span>
+        <span>${formatTimestamp(record.timestamp)}</span>
+      </div>
+      <pre><code>${escapeHtml(outputText)}</code></pre>
+    </div>
+  `;
+}
+
+function renderHtmlCustomToolCallEntry(
+  record: JsonlRecord,
+  item: Record<string, unknown>,
+): string {
+  const toolName = typeof item.name === "string" ? item.name : "custom-tool";
+  const status = typeof item.status === "string" ? ` [${item.status}]` : "";
+  const inputText = prettyStructuredText(item.input);
+  return `
+    <div class="bubble bubble-tool">
+      <div class="bubble-header">
+        <span>Custom Tool Call: ${toolName}${status}</span>
+        <span>${formatTimestamp(record.timestamp)}</span>
+      </div>
+      <pre><code>${escapeHtml(inputText)}</code></pre>
+    </div>
+  `;
+}
+
+function renderHtmlCustomToolOutputEntry(
+  record: JsonlRecord,
+  item: Record<string, unknown>,
+): string {
+  const callId = typeof item.call_id === "string" ? ` (${item.call_id})` : "";
+  const outputText = prettyStructuredText(item.output);
+  return `
+    <div class="bubble bubble-tool">
+      <div class="bubble-header">
+        <span>Custom Tool Output${callId}</span>
+        <span>${formatTimestamp(record.timestamp)}</span>
+      </div>
+      <pre><code>${escapeHtml(outputText)}</code></pre>
+    </div>
+  `;
+}
+
+function renderHtmlReasoningEntry(
+  record: JsonlRecord,
+  item: Record<string, unknown>,
+): string | null {
+  const summaries = Array.isArray(item.summary)
+    ? item.summary.map(extractReasoningSummaryText).filter(Boolean)
+    : [];
+  if (summaries.length === 0) {
+    return null;
+  }
+
+  return `
+    <div class="bubble bubble-reasoning">
+      <div class="bubble-header">
+        <span>Reasoning Summary</span>
+        <span>${formatTimestamp(record.timestamp)}</span>
+      </div>
+      <ul>
+        ${summaries.map(s => `<li>${escapeHtml(s)}</li>`).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderHtmlMessageContent(
+  content: unknown,
+  context: HtmlRenderContext,
+): { text: string; imageHtml: string[] } {
+  if (!Array.isArray(content)) {
+    return { text: "", imageHtml: [] };
+  }
+
+  const textChunks: string[] = [];
+  const imageHtml: string[] = [];
+
+  for (const item of content) {
+    if (typeof item === "string") {
+      textChunks.push(item);
+      continue;
+    }
+
+    const contentPart = asObject(item);
+    if (!contentPart) {
+      continue;
+    }
+
+    if (context.options.includeImages) {
+      const renderedImage = renderHtmlMessageImage(contentPart, context);
+      if (renderedImage) {
+        imageHtml.push(renderedImage);
+        continue;
+      }
+    }
+
+    if (looksLikeImageContentPart(contentPart)) {
+      continue;
+    }
+
+    if (typeof contentPart.text === "string") {
+      textChunks.push(contentPart.text);
+      continue;
+    }
+
+    if (typeof contentPart.input_text === "string") {
+      textChunks.push(contentPart.input_text);
+      continue;
+    }
+
+    if (typeof contentPart.output_text === "string") {
+      textChunks.push(contentPart.output_text);
+      continue;
+    }
+
+    textChunks.push(prettyStructuredText(contentPart));
+  }
+
+  return {
+    text: stripImagePlaceholderTags(textChunks.map((chunk) => chunk.trim()).filter(Boolean).join("\n\n")),
+    imageHtml,
+  };
+}
+
+function renderHtmlMessageImage(
+  contentPart: Record<string, unknown>,
+  context: HtmlRenderContext,
+): string | null {
+  if (!looksLikeImageContentPart(contentPart)) {
+    return null;
+  }
+
+  const imageSource =
+    typeof contentPart.image_url === "string"
+      ? contentPart.image_url.trim()
+      : typeof contentPart.url === "string"
+        ? contentPart.url.trim()
+        : "";
+  if (!imageSource) {
+    return null;
+  }
+
+  const imageReference = persistHtmlImageReference(imageSource, context);
+  if (!imageReference) {
+    return null;
+  }
+
+  const altText =
+    typeof contentPart.alt_text === "string" && contentPart.alt_text.trim()
+      ? contentPart.alt_text.trim()
+      : `Image ${context.nextImageIndex - 1}`;
+  return `<img src="${imageReference}" alt="${escapeHtml(altText)}">`;
+}
+
+function persistHtmlImageReference(
+  imageSource: string,
+  context: HtmlRenderContext,
+): string | null {
+  if (/^data:image\//i.test(imageSource)) {
+    const asset = createImageAssetFromDataUrl(imageSource, context as any); // Cast context to any because createImageAssetFromDataUrl expects MarkdownRenderContext but it's compatible
+    if (!asset) {
+      return null;
+    }
+
+    context.assets.push(asset);
+    return `./${context.assetDirectoryName}/${asset.fileName}`;
+  }
+
+  return imageSource;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 function buildMarkdownExport(
   sessionFilePath: string,
   records: JsonlRecord[],
@@ -936,6 +1509,10 @@ function renderReasoningEntry(
     .join("\n")}`;
 }
 
+function numberMarkdownTranscriptEntry(section: string, index: number): string {
+  return section.replace(/^###\s+/, `### ${index}. `);
+}
+
 function extractReasoningSummaryText(entry: unknown): string {
   if (typeof entry === "string") {
     return entry.trim();
@@ -1009,12 +1586,21 @@ function renderMessageContent(
   }
 
   return {
-    text: textChunks
+    text: stripImagePlaceholderTags(
+      textChunks
     .map((chunk) => chunk.trim())
       .filter(Boolean)
       .join("\n\n"),
+    ),
     imageMarkdown,
   };
+}
+
+function stripImagePlaceholderTags(text: string): string {
+  return text
+    .replace(/^\s*<\/?image>\s*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function renderMessageImage(
@@ -1294,7 +1880,7 @@ export function resolveFilesystemPath(inputPath: string): string {
 
 function normalizeWindowsPath(inputPath: string): string | null {
   const slashNormalized = inputPath.replace(/\//g, "\\");
-  if (!/^(?:[a-zA-Z]:\\|\\\\)/.test(slashNormalized)) {
+  if (!/^(?:[a-zA-Z]:\\|\\\\|[a-zA-Z]:$)/.test(slashNormalized)) {
     return null;
   }
 

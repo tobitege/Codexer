@@ -20,14 +20,44 @@ export type CodexerRPC = {
           path: string | null;
         };
       };
+      pickExportDirectory: {
+        params: {
+          sessionFilePath: string;
+        };
+        response: {
+          path: string | null;
+        };
+      };
       exportSessionMarkdown: {
         params: {
           sessionFilePath: string;
           includeImages: boolean;
           includeToolCallResults: boolean;
+          outputDirectory: string | null;
         };
         response: {
           outputPath: string;
+        };
+      };
+      startSessionHtmlExport: {
+        params: {
+          sessionFilePath: string;
+          includeImages: boolean;
+          includeToolCallResults: boolean;
+          outputDirectory: string | null;
+        };
+        response: {
+          jobId: string;
+        };
+      };
+      getExportJobStatus: {
+        params: {
+          jobId: string;
+        };
+        response: {
+          kind: "working" | "success" | "error";
+          message: string;
+          outputPath: string | null;
         };
       };
       revealPath: {
@@ -42,6 +72,12 @@ export type CodexerRPC = {
         params: {
           path: string;
         };
+        response: {
+          ok: boolean;
+        };
+      };
+      refreshWindowLayout: {
+        params: {};
         response: {
           ok: boolean;
         };
