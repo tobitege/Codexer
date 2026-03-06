@@ -3,14 +3,14 @@
 const childProcess = require("node:child_process");
 const path = require("node:path");
 
-const scriptPath = path.join(__dirname, "codex-sessions.ts");
+const scriptPath = path.join(__dirname, "codlogs-sessions.ts");
 const result = childProcess.spawnSync(
   process.execPath,
   ["--no-warnings", "--experimental-strip-types", scriptPath, ...process.argv.slice(2)],
   {
     env: {
       ...process.env,
-      CODEXER_COMMAND_NAME: "codex-sessions",
+      CODEXER_COMMAND_NAME: "codlogs-sessions",
     },
     stdio: "inherit",
     windowsHide: false,
@@ -18,7 +18,7 @@ const result = childProcess.spawnSync(
 );
 
 if (result.error) {
-  console.error(`Failed to launch codex-sessions: ${result.error.message}`);
+  console.error(`Failed to launch codlogs-sessions: ${result.error.message}`);
   process.exit(1);
 }
 

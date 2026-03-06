@@ -5,7 +5,7 @@ import {
   exportSessionJsonlToMarkdown,
   findCodexSessions,
   type FindCodexSessionsResult,
-} from "./src/shared/codex-core.ts";
+} from "./src/shared/codlogs-core.ts";
 
 type ParsedOptions = {
   codexHome: string;
@@ -234,8 +234,8 @@ function getCommandName(): string {
     return envCommandName;
   }
 
-  const invokedPath = process.argv[1] ? path.basename(process.argv[1]) : "codex-sessions";
-  return invokedPath.replace(/\.(?:cjs|js|mjs|ts)$/i, "") || "codex-sessions";
+  const invokedPath = process.argv[1] ? path.basename(process.argv[1]) : "codlogs-sessions";
+  return invokedPath.replace(/\.(?:cjs|js|mjs|ts)$/i, "") || "codlogs-sessions";
 }
 
 main().catch((error: unknown) => {

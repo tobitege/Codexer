@@ -7,7 +7,7 @@
   "type": "module",
   "bin": {
     "codlogs": "./codlogs.cjs",
-    "codex-sessions": "./codex-sessions.cjs"
+    "codlogs-sessions": "./codlogs-sessions.cjs"
   },
   "scripts": {
     "build:web": "vite build",
@@ -20,8 +20,8 @@
   "files": [
     "README.md",
     "codlogs.cjs",
-    "codex-sessions.cjs",
-    "codex-sessions.ts",
+    "codlogs-sessions.cjs",
+    "codlogs-sessions.ts",
     "electrobun.config.ts",
     "vite.config.ts",
     "tsconfig.json",

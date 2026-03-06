@@ -25,7 +25,7 @@ Install it globally from this folder:
 npm install -g d:\github\codlogs
 ```
 
-Use either `codlogs` or `codex-sessions`:
+Use either `codlogs` or `codlogs-sessions`:
 
 ```powershell
 codlogs

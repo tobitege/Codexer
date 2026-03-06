@@ -3,7 +3,7 @@ import { startTransition, useDeferredValue, useEffect, useRef, useState } from "
 import type {
   FindCodexSessionsResult,
   SessionMetaMatch,
-} from "../shared/codex-core.ts";
+} from "../shared/codlogs-core.ts";
 import type { CodexerRPC } from "../shared/rpc.ts";
 
 type BrowseMode = "all" | "folder";

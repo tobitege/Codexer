@@ -1,5 +1,5 @@
 import type { RPCSchema } from "electrobun/view";
-import type { FindCodexSessionsResult } from "./codex-core.ts";
+import type { FindCodexSessionsResult } from "./codlogs-core.ts";
 
 export type CodexerRPC = {
   bun: RPCSchema<{

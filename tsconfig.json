@@ -13,7 +13,7 @@
     "types": ["bun-types", "vite/client"]
   },
   "include": [
-    "codex-sessions.ts",
+    "codlogs-sessions.ts",
     "electrobun.config.ts",
     "vite.config.ts",
     "src/**/*.ts",

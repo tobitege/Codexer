@@ -5,7 +5,7 @@ import {
   exportSessionJsonlToMarkdown,
   exportSessionJsonlToHtml,
   findCodexSessions,
-} from "../shared/codex-core.ts";
+} from "../shared/codlogs-core.ts";
 import type { CodexerRPC } from "../shared/rpc.ts";
 
 const DEV_SERVER_PORT = 5173;
