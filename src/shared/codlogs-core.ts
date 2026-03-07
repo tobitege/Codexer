@@ -25,6 +25,7 @@ export type SessionMetaMatch = {
 export type FindCodexSessionsOptions = {
   codexHome?: string | null;
   cwdOnly?: boolean;
+  includeCrossSessionWrites?: boolean;
   targetDirectory?: string | null;
   currentWorkingDirectory?: string | null;
 };
@@ -39,6 +40,11 @@ export type FindCodexSessionsResult = {
   liveCount: number;
   archivedCount: number;
   sessions: SessionMetaMatch[];
+};
+
+export type SessionDetailMetrics = {
+  interactionCount: number;
+  fileSizeBytes: number;
 };
 
 export type MarkdownExportOptions = {
@@ -76,6 +82,7 @@ type SessionMetaRecord = {
 type ComparablePathAlias = {
   style: PathStyle;
   value: string;
+  compareValue: string;
 };
 
 type JsonlRecord = {
@@ -162,6 +169,7 @@ export async function findCodexSessions(
   let scopeMode: ScopeMode = "all";
   let targetRoot: string | null = null;
   let targetRootAliases: ComparablePathAlias[] | null = null;
+  const includeCrossSessionWrites = options.includeCrossSessionWrites === true;
 
   if (normalizedTargetDirectory !== null) {
     requestedDirectory =
@@ -207,6 +215,17 @@ export async function findCodexSessions(
       continue;
     }
 
+    if (targetRootAliases) {
+      const cwdMatches = matchesRootAliases(meta.cwd, targetRootAliases);
+      if (
+        !cwdMatches &&
+        (!includeCrossSessionWrites ||
+          !(await sessionTouchesRoot(entry.file, targetRootAliases, meta.cwd)))
+      ) {
+        continue;
+      }
+    }
+
     const indexEntry = sessionIndex.get(meta.id);
     matches.push({
       kind: entry.kind,
@@ -232,6 +251,51 @@ export async function findCodexSessions(
     liveCount,
     archivedCount: matches.length - liveCount,
     sessions: matches,
+  };
+}
+
+export async function getSessionDetailMetrics(
+  inputPath: string,
+): Promise<SessionDetailMetrics> {
+  const sessionFilePath = resolveFilesystemPath(inputPath);
+  if (!(await pathExists(sessionFilePath))) {
+    throw new Error(`Session file not found: ${sessionFilePath}`);
+  }
+
+  const [stat, content] = await Promise.all([
+    fs.stat(sessionFilePath),
+    fs.readFile(sessionFilePath, "utf8"),
+  ]);
+  const records = parseJsonlRecords(content);
+  let responseItemUserMessages = 0;
+  let eventUserMessages = 0;
+
+  for (const record of records) {
+    if (record.type === "response_item") {
+      const item = asObject(record.payload);
+      if (!item || item.type !== "message" || item.role !== "user") {
+        continue;
+      }
+
+      const messageText = extractMessageLikeText(item.content);
+      if (!looksLikeBootstrapContext(messageText)) {
+        responseItemUserMessages += 1;
+      }
+      continue;
+    }
+
+    if (record.type === "event_msg") {
+      const payload = asObject(record.payload);
+      if (payload?.type === "user_message") {
+        eventUserMessages += 1;
+      }
+    }
+  }
+
+  return {
+    interactionCount:
+      responseItemUserMessages > 0 ? responseItemUserMessages : eventUserMessages,
+    fileSizeBytes: stat.size,
   };
 }
 
@@ -621,7 +685,8 @@ async function filterWithConcurrency<T>(
 }
 
 function normalizeFileLookupPath(filePath: string): string {
-  return resolveFilesystemPath(filePath);
+  const resolvedPath = resolveFilesystemPath(filePath);
+  return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
 }
 
 async function sessionTouchesRoot(
@@ -1000,7 +1065,7 @@ function buildHtmlExport(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Codex Session - ${title}</title>
+  <title>Codex Session - ${escapeHtml(title)}</title>
   <style>${styles}</style>
   <script>
     function toggleTheme() {
@@ -1017,14 +1082,14 @@ function buildHtmlExport(
     <button class="theme-toggle" onclick="toggleTheme()">🌓 Theme</button>
     <h1>Codex Session Export</h1>
     <div class="meta-grid">
-      <div class="meta-item"><b>ID:</b> ${sessionMeta.id}</div>
-      <div class="meta-item"><b>Started:</b> ${sessionMeta.startedAt ?? "unknown"}</div>
-      <div class="meta-item"><b>CWD:</b> ${sessionMeta.cwd}</div>
-      <div class="meta-item"><b>Originator:</b> ${sessionMeta.originator ?? "unknown"}</div>
-      <div class="meta-item"><b>CLI:</b> ${sessionMeta.cliVersion ?? "unknown"}</div>
-      <div class="meta-item"><b>Source:</b> ${sessionMeta.source ?? "unknown"}</div>
-      <div class="meta-item"><b>Model:</b> ${sessionMeta.modelProvider ?? "unknown"}</div>
-      <div class="meta-item"><b>Exported:</b> ${new Date().toISOString()}</div>
+      <div class="meta-item"><b>ID:</b> ${escapeHtml(sessionMeta.id)}</div>
+      <div class="meta-item"><b>Started:</b> ${escapeHtml(sessionMeta.startedAt ?? "unknown")}</div>
+      <div class="meta-item"><b>CWD:</b> ${escapeHtml(sessionMeta.cwd)}</div>
+      <div class="meta-item"><b>Originator:</b> ${escapeHtml(sessionMeta.originator ?? "unknown")}</div>
+      <div class="meta-item"><b>CLI:</b> ${escapeHtml(sessionMeta.cliVersion ?? "unknown")}</div>
+      <div class="meta-item"><b>Source:</b> ${escapeHtml(sessionMeta.source ?? "unknown")}</div>
+      <div class="meta-item"><b>Model:</b> ${escapeHtml(sessionMeta.modelProvider ?? "unknown")}</div>
+      <div class="meta-item"><b>Exported:</b> ${escapeHtml(new Date().toISOString())}</div>
     </div>
   </header>
   <div class="transcript">
@@ -1086,8 +1151,8 @@ function renderHtmlToolCallEntry(
   return `
     <div class="bubble bubble-tool">
       <div class="bubble-header">
-        <span>${label}: ${toolName}</span>
-        <span>${formatTimestamp(record.timestamp)}</span>
+        <span>${escapeHtml(`${label}: ${toolName}`)}</span>
+        <span>${escapeHtml(formatTimestamp(record.timestamp))}</span>
       </div>
       <pre><code>${escapeHtml(argumentsText)}</code></pre>
     </div>
@@ -1104,8 +1169,8 @@ function renderHtmlToolOutputEntry(
   return `
     <div class="bubble bubble-tool">
       <div class="bubble-header">
-        <span>${label}${callId}</span>
-        <span>${formatTimestamp(record.timestamp)}</span>
+        <span>${escapeHtml(`${label}${callId}`)}</span>
+        <span>${escapeHtml(formatTimestamp(record.timestamp))}</span>
       </div>
       <pre><code>${escapeHtml(outputText)}</code></pre>
     </div>
@@ -1122,8 +1187,8 @@ function renderHtmlCustomToolCallEntry(
   return `
     <div class="bubble bubble-tool">
       <div class="bubble-header">
-        <span>Custom Tool Call: ${toolName}${status}</span>
-        <span>${formatTimestamp(record.timestamp)}</span>
+        <span>${escapeHtml(`Custom Tool Call: ${toolName}${status}`)}</span>
+        <span>${escapeHtml(formatTimestamp(record.timestamp))}</span>
       </div>
       <pre><code>${escapeHtml(inputText)}</code></pre>
     </div>
@@ -1139,8 +1204,8 @@ function renderHtmlCustomToolOutputEntry(
   return `
     <div class="bubble bubble-tool">
       <div class="bubble-header">
-        <span>Custom Tool Output${callId}</span>
-        <span>${formatTimestamp(record.timestamp)}</span>
+        <span>${escapeHtml(`Custom Tool Output${callId}`)}</span>
+        <span>${escapeHtml(formatTimestamp(record.timestamp))}</span>
       </div>
       <pre><code>${escapeHtml(outputText)}</code></pre>
     </div>
@@ -1256,7 +1321,7 @@ function renderHtmlMessageImage(
     typeof contentPart.alt_text === "string" && contentPart.alt_text.trim()
       ? contentPart.alt_text.trim()
       : `Image ${context.nextImageIndex - 1}`;
-  return `<img src="${imageReference}" alt="${escapeHtml(altText)}">`;
+  return `<img src="${escapeHtml(imageReference)}" alt="${escapeHtml(altText)}">`;
 }
 
 function persistHtmlImageReference(
@@ -1277,7 +1342,7 @@ function persistHtmlImageReference(
 }
 
 function escapeHtml(text: string): string {
-  return text
+  return stabilizeExportText(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -1603,6 +1668,49 @@ function stripImagePlaceholderTags(text: string): string {
     .trim();
 }
 
+function extractMessageLikeText(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const textChunks: string[] = [];
+  for (const item of content) {
+    if (typeof item === "string") {
+      textChunks.push(item);
+      continue;
+    }
+
+    const contentPart = asObject(item);
+    if (!contentPart || looksLikeImageContentPart(contentPart)) {
+      continue;
+    }
+
+    if (typeof contentPart.text === "string") {
+      textChunks.push(contentPart.text);
+      continue;
+    }
+
+    if (typeof contentPart.input_text === "string") {
+      textChunks.push(contentPart.input_text);
+      continue;
+    }
+
+    if (typeof contentPart.output_text === "string") {
+      textChunks.push(contentPart.output_text);
+      continue;
+    }
+
+    textChunks.push(prettyStructuredText(contentPart));
+  }
+
+  return stripImagePlaceholderTags(
+    textChunks
+      .map((chunk) => chunk.trim())
+      .filter(Boolean)
+      .join("\n\n"),
+  );
+}
+
 function renderMessageImage(
   contentPart: Record<string, unknown>,
   context: MarkdownRenderContext,
@@ -1708,6 +1816,52 @@ function escapeMarkdownText(value: string): string {
   return value.replace(/[\\[\]()]/g, "\\$&");
 }
 
+function stabilizeExportText(value: string): string {
+  let output = "";
+
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+
+    if (
+      codeUnit === 0x09 ||
+      codeUnit === 0x0a ||
+      codeUnit === 0x0d
+    ) {
+      output += value[index];
+      continue;
+    }
+
+    if (
+      (codeUnit >= 0x00 && codeUnit <= 0x1f) ||
+      (codeUnit >= 0x7f && codeUnit <= 0x9f)
+    ) {
+      output += `\\u${codeUnit.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = value.charCodeAt(index + 1);
+      if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+        output += value[index] + value[index + 1];
+        index += 1;
+        continue;
+      }
+
+      output += `\\u${codeUnit.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+
+    if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      output += `\\u${codeUnit.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+
+    output += value[index];
+  }
+
+  return output;
+}
+
 function looksLikeBootstrapContext(text: string): boolean {
   return (
     text.includes("# AGENTS.md instructions") ||
@@ -1739,7 +1893,13 @@ function prettyStructuredText(value: unknown): string {
 }
 
 function renderCodeBlock(text: string, language: string): string {
-  return `~~~${language}\n${text || "(empty)"}\n~~~`;
+  const stabilizedText = stabilizeExportText(text || "(empty)");
+  const longestFenceRun = Math.max(
+    0,
+    ...Array.from(stabilizedText.matchAll(/~+/g), (match) => match[0].length),
+  );
+  const fence = "~".repeat(Math.max(3, longestFenceRun + 1));
+  return `${fence}${language}\n${stabilizedText}\n${fence}`;
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -1771,8 +1931,8 @@ function matchesRootAliases(
 
       if (
         isSamePathOrChildForStyle(
-          candidateAlias.value,
-          rootAlias.value,
+          candidateAlias.compareValue,
+          rootAlias.compareValue,
           candidateAlias.style,
         )
       ) {
@@ -1818,7 +1978,9 @@ function getComparablePathAliases(inputPath: string): ComparablePathAlias[] {
       return;
     }
 
-    aliases.set(`${style}:${normalized}`, { style, value: normalized });
+    const compareValue =
+      style === "win" ? normalizeWindowsComparisonPath(normalized) : normalized;
+    aliases.set(`${style}:${compareValue}`, { style, value: normalized, compareValue });
   };
 
   const windowsPath = normalizeWindowsPath(trimmed);
@@ -1884,8 +2046,11 @@ function normalizeWindowsPath(inputPath: string): string | null {
     return null;
   }
 
-  const normalized = trimTrailingWindowsSeparators(path.win32.normalize(slashNormalized));
-  return normalized.toLowerCase();
+  return trimTrailingWindowsSeparators(path.win32.normalize(slashNormalized));
+}
+
+function normalizeWindowsComparisonPath(inputPath: string): string {
+  return inputPath.toLowerCase();
 }
 
 function normalizePosixPath(inputPath: string): string | null {

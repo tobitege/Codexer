@@ -5,6 +5,7 @@ import {
   exportSessionJsonlToMarkdown,
   exportSessionJsonlToHtml,
   findCodexSessions,
+  getSessionDetailMetrics,
 } from "../shared/codlogs-core.ts";
 import type { CodexerRPC } from "../shared/rpc.ts";
 
@@ -52,6 +53,13 @@ function getStartingFolder(candidate: string | null): string {
 
 type AppSettings = {
   exportDirectory?: string | null;
+  lastOpenedFolder?: string | null;
+  windowFrame?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
 };
 
 type ExportJobStatus = {
@@ -62,6 +70,15 @@ type ExportJobStatus = {
 
 const EXPORT_JOB_RETENTION_MS = 5 * 60 * 1000;
 const exportJobs = new Map<string, ExportJobStatus>();
+const DEFAULT_WINDOW_FRAME = {
+  width: 1600,
+  height: 1000,
+  x: 100,
+  y: 60,
+};
+
+let settingsCache: AppSettings | null = null;
+let settingsWriteQueue = Promise.resolve();
 
 function asErrorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
@@ -135,19 +152,39 @@ async function getSettingsFilePath(): Promise<string> {
 }
 
 async function readAppSettings(): Promise<AppSettings> {
+  if (settingsCache) {
+    return settingsCache;
+  }
+
   try {
     const settingsPath = await getSettingsFilePath();
     const raw = await fs.readFile(settingsPath, "utf8");
     const parsed = JSON.parse(raw) as AppSettings;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    settingsCache = parsed && typeof parsed === "object" ? parsed : {};
+    return settingsCache;
   } catch {
-    return {};
+    settingsCache = {};
+    return settingsCache;
   }
 }
 
 async function writeAppSettings(settings: AppSettings): Promise<void> {
   const settingsPath = await getSettingsFilePath();
-  await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), "utf8");
+  settingsCache = settings;
+  settingsWriteQueue = settingsWriteQueue.then(() =>
+    fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), "utf8"),
+  );
+  await settingsWriteQueue;
+}
+
+async function updateAppSettings(
+  updater: (settings: AppSettings) => AppSettings | void,
+): Promise<AppSettings> {
+  const currentSettings = await readAppSettings();
+  const nextSettings = { ...currentSettings };
+  const updatedSettings = updater(nextSettings) ?? nextSettings;
+  await writeAppSettings(updatedSettings);
+  return updatedSettings;
 }
 
 async function getRememberedExportDirectory(): Promise<string | null> {
@@ -158,9 +195,97 @@ async function getRememberedExportDirectory(): Promise<string | null> {
 }
 
 async function rememberExportDirectory(exportDirectory: string): Promise<void> {
+  await updateAppSettings((settings) => {
+    settings.exportDirectory = exportDirectory;
+  });
+}
+
+async function getRememberedOpenedFolder(): Promise<string | null> {
   const settings = await readAppSettings();
-  settings.exportDirectory = exportDirectory;
-  await writeAppSettings(settings);
+  return typeof settings.lastOpenedFolder === "string"
+    ? normalizeDialogResult(settings.lastOpenedFolder)
+    : null;
+}
+
+async function rememberOpenedFolder(folderPath: string): Promise<void> {
+  await updateAppSettings((settings) => {
+    settings.lastOpenedFolder = folderPath;
+  });
+  currentWorkingDirectoryPreference = folderPath;
+}
+
+function normalizeWindowFrame(
+  value: AppSettings["windowFrame"] | undefined,
+): typeof DEFAULT_WINDOW_FRAME {
+  if (!value) {
+    return DEFAULT_WINDOW_FRAME;
+  }
+
+  const { x, y, width, height } = value;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width < 640 ||
+    height < 480
+  ) {
+    return DEFAULT_WINDOW_FRAME;
+  }
+
+  return {
+    x,
+    y,
+    width,
+    height,
+  };
+}
+
+async function getRememberedWindowFrame(): Promise<typeof DEFAULT_WINDOW_FRAME> {
+  const settings = await readAppSettings();
+  return normalizeWindowFrame(settings.windowFrame);
+}
+
+async function rememberWindowFrame(window: BrowserWindow<any>): Promise<void> {
+  if (window.isMinimized() || window.isMaximized() || window.isFullScreen()) {
+    return;
+  }
+
+  const frame = window.getFrame();
+  await updateAppSettings((settings) => {
+    settings.windowFrame = {
+      x: frame.x,
+      y: frame.y,
+      width: frame.width,
+      height: frame.height,
+    };
+  });
+}
+
+function setupWindowFramePersistence(window: BrowserWindow<any>): void {
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleSave = (): void => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+    }
+
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      void rememberWindowFrame(window);
+    }, 150);
+  };
+
+  window.on("move", scheduleSave);
+  window.on("resize", scheduleSave);
+  window.on("close", () => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+
+    void rememberWindowFrame(window);
+  });
 }
 
 function refreshWindowLayout(window: BrowserWindow<any>): { ok: boolean } {
@@ -180,21 +305,36 @@ function refreshWindowLayout(window: BrowserWindow<any>): { ok: boolean } {
 }
 
 let mainWindow: BrowserWindow<any>;
+const rememberedOpenedFolder = await getRememberedOpenedFolder();
+let currentWorkingDirectoryPreference =
+  rememberedOpenedFolder ?? getAppWorkingDirectory();
 
 const rpc = BrowserView.defineRPC<CodexerRPC>({
   maxRequestTime: RPC_MAX_REQUEST_TIME_MS,
   handlers: {
     requests: {
-      loadSessions: async ({ codexHome, targetDirectory, cwdOnly }) =>
+      loadSessions: async ({
+        codexHome,
+        targetDirectory,
+        cwdOnly,
+        includeCrossSessionWrites,
+      }) =>
         findCodexSessions({
           codexHome,
           targetDirectory,
           cwdOnly,
-          currentWorkingDirectory: getAppWorkingDirectory(),
+          includeCrossSessionWrites,
+          currentWorkingDirectory: currentWorkingDirectoryPreference,
+        }).then(async (result) => {
+          if (result.requestedDirectory) {
+            await rememberOpenedFolder(result.requestedDirectory);
+          }
+
+          return result;
         }),
       pickDirectory: async ({ startingFolder }) => {
         const [chosenPath] = await Utils.openFileDialog({
-          startingFolder: getStartingFolder(startingFolder),
+          startingFolder: getStartingFolder(startingFolder ?? currentWorkingDirectoryPreference),
           canChooseFiles: false,
           canChooseDirectory: true,
           allowsMultipleSelection: false,
@@ -225,6 +365,8 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
           path: selectedPath,
         };
       },
+      getSessionDetailMetrics: async ({ sessionFilePath }) =>
+        getSessionDetailMetrics(sessionFilePath),
       exportSessionMarkdown: async ({
         sessionFilePath,
         includeImages,
@@ -270,18 +412,16 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
 });
 
 const url = await getMainViewUrl();
+const initialFrame = await getRememberedWindowFrame();
 
 mainWindow = new BrowserWindow({
   title: "codlogs",
   url,
   rpc,
-  frame: {
-    width: 1600,
-    height: 1000,
-    x: 100,
-    y: 60,
-  },
+  frame: initialFrame,
 });
+
+setupWindowFramePersistence(mainWindow);
 
 mainWindow.webview.on("dom-ready", () => {
   console.log("codlogs mainview ready");

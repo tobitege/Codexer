@@ -1,5 +1,5 @@
 import type { RPCSchema } from "electrobun/view";
-import type { FindCodexSessionsResult } from "./codlogs-core.ts";
+import type { FindCodexSessionsResult, SessionDetailMetrics } from "./codlogs-core.ts";
 
 export type CodexerRPC = {
   bun: RPCSchema<{
@@ -9,6 +9,7 @@ export type CodexerRPC = {
           codexHome: string | null;
           targetDirectory: string | null;
           cwdOnly: boolean;
+          includeCrossSessionWrites: boolean;
         };
         response: FindCodexSessionsResult;
       };
@@ -27,6 +28,12 @@ export type CodexerRPC = {
         response: {
           path: string | null;
         };
+      };
+      getSessionDetailMetrics: {
+        params: {
+          sessionFilePath: string;
+        };
+        response: SessionDetailMetrics;
       };
       exportSessionMarkdown: {
         params: {

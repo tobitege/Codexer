@@ -2,6 +2,7 @@ import { Electroview } from "electrobun/view";
 import { startTransition, useDeferredValue, useEffect, useRef, useState } from "react";
 import type {
   FindCodexSessionsResult,
+  SessionDetailMetrics,
   SessionMetaMatch,
 } from "../shared/codlogs-core.ts";
 import type { CodexerRPC } from "../shared/rpc.ts";
@@ -12,6 +13,7 @@ type AppliedQuery = {
   browseMode: BrowseMode;
   targetDirectory: string | null;
   cwdOnly: boolean;
+  includeCrossSessionWrites: boolean;
 };
 
 type ExportState = {
@@ -20,12 +22,19 @@ type ExportState = {
   outputPath: string | null;
 };
 
+type SessionDetailMetricsState = {
+  kind: "idle" | "loading" | "ready" | "error";
+  interactionCount: number | null;
+  fileSizeBytes: number | null;
+};
+
 const timestampFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "short",
 });
 
 const RPC_MAX_REQUEST_TIME_MS = 15 * 60 * 1000;
+const REPOSITORY_URL = "https://github.com/tobitege/codlogs";
 
 const rpc = Electroview.defineRPC<CodexerRPC>({
   maxRequestTime: RPC_MAX_REQUEST_TIME_MS,
@@ -99,6 +108,34 @@ function formatTimestamp(value: string | null): string {
   return Number.isNaN(parsed) ? value : timestampFormatter.format(parsed);
 }
 
+function formatFileSize(value: number | null): string {
+  if (value === null) {
+    return "Loading...";
+  }
+
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = -1;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size >= 100 ? size.toFixed(0) : size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function formatInteractionCount(value: number | null): string {
+  if (value === null) {
+    return "Loading...";
+  }
+
+  return `${value} ${value === 1 ? "prompt" : "prompts"}`;
+}
+
 function matchesSearch(session: SessionMetaMatch, query: string): boolean {
   const trimmedQuery = query.trim().toLowerCase();
   if (!trimmedQuery) {
@@ -117,6 +154,19 @@ function matchesSearch(session: SessionMetaMatch, query: string): boolean {
 
 function asErrorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
+}
+
+function GitHubMark(props: { className?: string }): JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      className={props.className}
+      viewBox="0 0 16 16"
+      fill="currentColor"
+    >
+      <path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49C4 14.09 3.48 13.22 3.32 12.77c-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.01.08-2.11 0 0 .67-.21 2.2.82a7.66 7.66 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.91.08 2.11.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
+  );
 }
 
 function getRequestedFolderTarget(folderPath: string): string {
@@ -142,13 +192,26 @@ function App() {
   const [codexHome, setCodexHome] = useState("");
   const [folderPath, setFolderPath] = useState("");
   const [cwdOnly, setCwdOnly] = useState(false);
+  const [includeCrossSessionWrites, setIncludeCrossSessionWrites] = useState(false);
   const [appliedQuery, setAppliedQuery] = useState<AppliedQuery>({
     browseMode: "folder",
     targetDirectory: "",
     cwdOnly: false,
+    includeCrossSessionWrites: false,
   });
   const [searchQuery, setSearchQuery] = useState("");
+  const [showLiveSessions, setShowLiveSessions] = useState(true);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(true);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [sessionDetailMetricsByFile, setSessionDetailMetricsByFile] = useState<
+    Record<string, SessionDetailMetrics>
+  >({});
+  const [sessionDetailMetricsState, setSessionDetailMetricsState] =
+    useState<SessionDetailMetricsState>({
+      kind: "idle",
+      interactionCount: null,
+      fileSizeBytes: null,
+    });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<ExportState>({
@@ -161,11 +224,11 @@ function App() {
   const codexHomeRef = useRef(codexHome);
   const folderPathRef = useRef(folderPath);
   const loadRequestIdRef = useRef(0);
+  const detailRequestIdRef = useRef(0);
   const exportRequestIdRef = useRef(0);
   const initialWindowRefreshDoneRef = useRef(false);
 
   const deferredSearchQuery = useDeferredValue(searchQuery);
-  const deferredFolderPath = useDeferredValue(folderPath);
 
   useEffect(() => {
     void loadSessions("", "folder");
@@ -179,13 +242,23 @@ function App() {
     folderPathRef.current = folderPath;
   }, [folderPath]);
 
-  const filteredSessions = (result?.sessions ?? []).filter((session) =>
-    matchesSearch(session, deferredSearchQuery),
-  );
+  const filteredSessions = (result?.sessions ?? []).filter((session) => {
+    if (session.kind === "live" && !showLiveSessions) {
+      return false;
+    }
+
+    if (session.kind === "archived" && !showArchivedSessions) {
+      return false;
+    }
+
+    return matchesSearch(session, deferredSearchQuery);
+  });
   const activeSession =
     filteredSessions.find((session) => session.file === selectedFile) ??
     filteredSessions[0] ??
     null;
+  const activeSessionDetailMetrics =
+    activeSession ? sessionDetailMetricsByFile[activeSession.file] ?? null : null;
 
   useEffect(() => {
     const hasSelectedSession = filteredSessions.some(
@@ -199,10 +272,71 @@ function App() {
     }
   }, [filteredSessions, selectedFile]);
 
+  useEffect(() => {
+    if (!activeSession) {
+      setSessionDetailMetricsState({
+        kind: "idle",
+        interactionCount: null,
+        fileSizeBytes: null,
+      });
+      return;
+    }
+
+    if (activeSessionDetailMetrics) {
+      setSessionDetailMetricsState({
+        kind: "ready",
+        interactionCount: activeSessionDetailMetrics.interactionCount,
+        fileSizeBytes: activeSessionDetailMetrics.fileSizeBytes,
+      });
+      return;
+    }
+
+    const requestId = detailRequestIdRef.current + 1;
+    detailRequestIdRef.current = requestId;
+    setSessionDetailMetricsState({
+      kind: "loading",
+      interactionCount: null,
+      fileSizeBytes: null,
+    });
+
+    void (async () => {
+      try {
+        const metrics = await getRpc().request.getSessionDetailMetrics({
+          sessionFilePath: activeSession.file,
+        });
+
+        if (requestId !== detailRequestIdRef.current) {
+          return;
+        }
+
+        setSessionDetailMetricsByFile((current) => ({
+          ...current,
+          [activeSession.file]: metrics,
+        }));
+        setSessionDetailMetricsState({
+          kind: "ready",
+          interactionCount: metrics.interactionCount,
+          fileSizeBytes: metrics.fileSizeBytes,
+        });
+      } catch {
+        if (requestId !== detailRequestIdRef.current) {
+          return;
+        }
+
+        setSessionDetailMetricsState({
+          kind: "error",
+          interactionCount: null,
+          fileSizeBytes: null,
+        });
+      }
+    })();
+  }, [activeSession, activeSessionDetailMetrics]);
+
   async function loadSessions(
     targetDirectory: string | null,
     nextBrowseMode: BrowseMode,
     nextCwdOnly = cwdOnly,
+    nextIncludeCrossSessionWrites = includeCrossSessionWrites,
   ): Promise<void> {
     const requestId = loadRequestIdRef.current + 1;
     loadRequestIdRef.current = requestId;
@@ -214,6 +348,7 @@ function App() {
         codexHome: codexHome.trim() || null,
         targetDirectory,
         cwdOnly: nextCwdOnly,
+        includeCrossSessionWrites: nextIncludeCrossSessionWrites,
       });
 
       if (requestId !== loadRequestIdRef.current) {
@@ -225,15 +360,13 @@ function App() {
         browseMode: nextBrowseMode,
         targetDirectory,
         cwdOnly: nextCwdOnly,
+        includeCrossSessionWrites: nextIncludeCrossSessionWrites,
       });
       if (!codexHomeRef.current.trim()) {
         setCodexHome(nextResult.codexHome);
       }
       if (!folderPathRef.current.trim()) {
         setFolderPath(nextResult.currentWorkingDirectory);
-      }
-      if (targetDirectory !== null && nextResult.requestedDirectory) {
-        setFolderPath(nextResult.requestedDirectory);
       }
       setSelectedFile((current) =>
         current && nextResult.sessions.some((session) => session.file === current)
@@ -268,7 +401,7 @@ function App() {
       }
 
       setFolderPath(path);
-      void loadSessions(path, "folder", cwdOnly);
+      void loadSessions(path, "folder", cwdOnly, includeCrossSessionWrites);
     } catch (pickError) {
       setError(asErrorMessage(pickError));
     }
@@ -408,7 +541,12 @@ function App() {
   }
 
   function handleFilterByFolder(): void {
-    void loadSessions(getRequestedFolderTarget(deferredFolderPath), "folder", cwdOnly);
+    void loadSessions(
+      getRequestedFolderTarget(folderPath),
+      "folder",
+      cwdOnly,
+      includeCrossSessionWrites,
+    );
   }
 
   function handleRefresh(): void {
@@ -416,6 +554,7 @@ function App() {
       appliedQuery.targetDirectory,
       appliedQuery.browseMode,
       appliedQuery.cwdOnly,
+      appliedQuery.includeCrossSessionWrites,
     );
   }
 
@@ -428,7 +567,25 @@ function App() {
           <div className="hero-content">
             <h1>codlogs</h1>
             <p className="hero-copy">
-              Browse and export your Codex sessions with ease.
+              <span>Browse and export your Codex sessions with ease.</span>
+              <span className="hero-copy-separator" aria-hidden="true">
+                •
+              </span>
+              <span>(c) 2026 @tobitege</span>
+              <a
+                className="hero-copy-link"
+                href={REPOSITORY_URL}
+                target="_blank"
+                rel="noreferrer"
+                aria-label="Open the codlogs GitHub repository"
+                title={REPOSITORY_URL}
+                onClick={(event) => {
+                  event.preventDefault();
+                  void openPath(REPOSITORY_URL);
+                }}
+              >
+                <GitHubMark className="hero-copy-icon" />
+              </a>
             </p>
           </div>
           <div className="hero-stats">
@@ -448,54 +605,85 @@ function App() {
         </header>
 
         <section className="control-strip">
-          <div className="search-container">
-            <span className="search-icon">🔍</span>
-            <input
-              value={folderPath}
-              onChange={(event) => setFolderPath(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  handleFilterByFolder();
-                }
-              }}
-              placeholder="Filter by folder or repo path..."
-            />
+          <div className="control-strip-main">
+            <div className="search-container">
+              <span className="search-icon">🔍</span>
+              <input
+                value={folderPath}
+                onChange={(event) => setFolderPath(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    handleFilterByFolder();
+                  }
+                }}
+                placeholder="Filter by folder or repo path..."
+              />
+            </div>
+            <div className="filter-actions">
+              <button className="ghost-button" onClick={() => void pickFolder()}>
+                Choose Folder
+              </button>
+              <button className="ghost-button" onClick={handleRefresh}>
+                Refresh
+              </button>
+              <button className="primary-button" onClick={handleFilterByFolder}>
+                Filter
+              </button>
+              <button className="primary-button" onClick={handleLoadAll}>
+                Show All
+              </button>
+            </div>
           </div>
-          <div className="filter-actions">
-            <button className="ghost-button" onClick={() => void pickFolder()}>
-              Choose Folder
-            </button>
-            <button className="ghost-button" onClick={handleRefresh}>
-              Refresh
-            </button>
-            <button className="primary-button" onClick={handleFilterByFolder}>
-              Filter
-            </button>
-            <button className="primary-button" onClick={handleLoadAll}>
-              Show All
-            </button>
+          <div className="control-strip-options">
+            <label className="checkbox-label compact-checkbox" title="Include sessions that worked on or wrote into this folder even if the session started elsewhere.">
+              <input
+                type="checkbox"
+                checked={includeCrossSessionWrites}
+                onChange={(event) => setIncludeCrossSessionWrites(event.target.checked)}
+              />
+              <span>Cross-session writes</span>
+            </label>
           </div>
         </section>
 
         <section className="content-grid">
           <aside className="panel">
             <div className="panel-header">
-              <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
-                <h2>Sessions</h2>
-                <span style={{ fontSize: "0.85rem", color: "var(--color-text-muted)" }}>
-                  {filteredSessions.length} {filteredSessions.length === 1 ? "match" : "matches"}
-                </span>
+              <div className="panel-header-row">
+                <div className="panel-header-title">
+                  <h2>Sessions</h2>
+                  <span className="panel-header-count">
+                    {filteredSessions.length} {filteredSessions.length === 1 ? "match" : "matches"}
+                  </span>
+                </div>
               </div>
-              <div className="search-container compact" style={{ height: "2.2rem", flex: "0 0 150px" }}>
+              <div className="search-container compact panel-search">
                 <input
                   value={searchQuery}
                   onChange={(event) => {
                     setSearchQuery(event.target.value);
                   }}
                   placeholder="Search..."
-                  style={{ fontSize: "0.85rem" }}
                 />
+              </div>
+              <div className="session-filter-row">
+                <label className="checkbox-label compact-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={showLiveSessions}
+                    onChange={(event) => setShowLiveSessions(event.target.checked)}
+                  />
+                  <span>Live</span>
+                </label>
+                <label className="checkbox-label compact-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={showArchivedSessions}
+                    onChange={(event) => setShowArchivedSessions(event.target.checked)}
+                  />
+                  <span>Archived</span>
+                </label>
               </div>
             </div>
 
@@ -564,6 +752,22 @@ function App() {
                     </div>
                   </div>
                   <MetaItem label="Session ID" value={activeSession.id} />
+                  <MetaItem
+                    label="Interactions"
+                    value={
+                      sessionDetailMetricsState.kind === "error"
+                        ? "Unavailable"
+                        : formatInteractionCount(sessionDetailMetricsState.interactionCount)
+                    }
+                  />
+                  <MetaItem
+                    label="File Size"
+                    value={
+                      sessionDetailMetricsState.kind === "error"
+                        ? "Unavailable"
+                        : formatFileSize(sessionDetailMetricsState.fileSizeBytes)
+                    }
+                  />
                   <MetaItem label="Working Directory" value={activeSession.cwd} />
                   <MetaItem label="Source File" value={formatDisplayPath(activeSession.file)} />
                 </div>
