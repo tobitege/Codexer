@@ -29,6 +29,8 @@ export type SessionMetaMatch = {
 export type FindCodexSessionsOptions = {
   codexHome?: string | null;
   cwdOnly?: boolean;
+  dateFrom?: string | null;
+  dateTo?: string | null;
   includeCrossSessionWrites?: boolean;
   targetDirectory?: string | null;
   currentWorkingDirectory?: string | null;
@@ -49,11 +51,37 @@ export type FindCodexSessionsResult = {
 export type SessionDetailMetrics = {
   interactionCount: number;
   toolCallCount: number;
+  tokenUsage: SessionTokenUsage | null;
   fileSizeBytes: number;
   analysisKind: "full" | "partial" | "skipped";
   skipReason: string | null;
   largestParsedLineBytes: number | null;
   oversizedLineCount: number;
+};
+
+export type SessionTokenUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+};
+
+export type SessionTokenUsageScanProgress = {
+  bytesProcessed: number;
+  fileSizeBytes: number;
+};
+
+export type ReadSessionTokenUsageOptions = {
+  signal?: AbortSignal;
+  onProgress?: (progress: SessionTokenUsageScanProgress) => void | Promise<void>;
+};
+
+export type ReadSessionTokenUsageResult = {
+  tokenUsage: SessionTokenUsage | null;
+  fileSizeBytes: number;
+  oversizedLineCount: number;
+  tokenCountRows: number;
 };
 
 export type SessionDetailMetricsOptions = {
@@ -213,11 +241,23 @@ type SessionFileProbe = {
   meta: { id: string; cwd: string; startedAt: string | null; source: string | null } | null;
 };
 
+type CodexSessionFolderDateRange = {
+  active: boolean;
+  fromKey: number | null;
+  toKey: number | null;
+};
+
 type JsonlLineEvent =
   | {
       kind: "line";
       lineNumber: number;
       line: string;
+      byteLength: number;
+      bytesProcessed: number;
+    }
+  | {
+      kind: "skipped";
+      lineNumber: number;
       byteLength: number;
       bytesProcessed: number;
     }
@@ -247,6 +287,7 @@ type StreamJsonlLinesOptions = {
   signal?: AbortSignal;
   maxLineBytes?: number;
   oversizedStrategy?: "emit" | "throw";
+  requiredLineContent?: Buffer;
 };
 
 type StreamJsonlRecordsOptions = StreamJsonlLinesOptions;
@@ -278,6 +319,7 @@ export const MAX_JSONL_LINE_BYTES_SOFT = 8 * 1024 * 1024;
 export const MAX_JSONL_LINE_BYTES_HARD = 32 * 1024 * 1024;
 export const EXPORT_MAX_JSONL_LINE_BYTES = 128 * 1024 * 1024;
 const EXPORT_PROGRESS_PULSE_BYTES = 4 * 1024 * 1024;
+const TOKEN_COUNT_LINE_NEEDLE = Buffer.from('"token_count"', "utf8");
 const WINDOWS_PATH_CANDIDATE_REGEX =
   /(?:\\\\\?\\)?[a-zA-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g;
 const WSL_UNC_PATH_CANDIDATE_REGEX =
@@ -386,6 +428,82 @@ function parseSessionMetaLine(
   };
 }
 
+function buildCodexSessionFolderDateRange(
+  dateFrom: string | null | undefined,
+  dateTo: string | null | undefined,
+): CodexSessionFolderDateRange {
+  const fromKey = parseDateInputKey(dateFrom);
+  const toKey = parseDateInputKey(dateTo);
+  return {
+    active: fromKey !== null || toKey !== null,
+    fromKey,
+    toKey,
+  };
+}
+
+function codexSessionFileMatchesFolderDateRange(
+  filePath: string,
+  range: CodexSessionFolderDateRange,
+): boolean {
+  if (!range.active) {
+    return true;
+  }
+
+  const folderDateKey = getCodexSessionFolderDateKey(filePath);
+  if (folderDateKey === null) {
+    return false;
+  }
+
+  return (
+    (range.fromKey === null || folderDateKey >= range.fromKey) &&
+    (range.toKey === null || folderDateKey <= range.toKey)
+  );
+}
+
+function getCodexSessionFolderDateKey(filePath: string): number | null {
+  const match =
+    /[\\/](?:archived_)?sessions[\\/](\d{4})[\\/](\d{2})[\\/](\d{2})[\\/]/i.exec(
+      filePath,
+    );
+  if (!match) {
+    return null;
+  }
+
+  return parseDatePartsKey(match[1], match[2], match[3]);
+}
+
+function parseDateInputKey(value: string | null | undefined): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value?.trim() ?? "");
+  if (!match) {
+    return null;
+  }
+
+  return parseDatePartsKey(match[1], match[2], match[3]);
+}
+
+function parseDatePartsKey(
+  yearText: string | undefined,
+  monthText: string | undefined,
+  dayText: string | undefined,
+): number | null {
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+
+  return year * 10000 + month * 100 + day;
+}
+
 async function *streamJsonlLines(
   filePath: string,
   options: StreamJsonlLinesOptions = {},
@@ -422,6 +540,7 @@ async function *streamJsonlLines(
           maxLineBytes,
           oversizedStrategy,
           bytesProcessed,
+          options.requiredLineContent,
         );
         pending = Buffer.alloc(0);
         oversizeByteLength = null;
@@ -465,6 +584,7 @@ async function *streamJsonlLines(
         maxLineBytes,
         oversizedStrategy,
         bytesProcessed,
+        options.requiredLineContent,
       );
       lineNumber += 1;
       if (lineEvent) {
@@ -485,6 +605,7 @@ function createJsonlLineEvent(
   maxLineBytes: number,
   oversizedStrategy: "emit" | "throw",
   bytesProcessed: number,
+  requiredLineContent?: Buffer,
 ): JsonlLineEvent | null {
   const fullByteLength =
     oversizeByteLength ?? pending.length + trailingSegment.length;
@@ -508,6 +629,15 @@ function createJsonlLineEvent(
       : trailingSegment.length === 0
         ? pending
         : concatByteSequences(pending, trailingSegment);
+
+  if (requiredLineContent && !lineBuffer.includes(requiredLineContent)) {
+    return {
+      kind: "skipped",
+      lineNumber,
+      byteLength: fullByteLength,
+      bytesProcessed,
+    };
+  }
 
   let line = lineBuffer.toString("utf8");
   if (lineNumber === 1) {
@@ -550,6 +680,9 @@ async function *streamJsonlRecords(
   for await (const lineEvent of streamJsonlLines(filePath, options)) {
     if (lineEvent.kind === "oversized") {
       yield lineEvent;
+      continue;
+    }
+    if (lineEvent.kind === "skipped") {
       continue;
     }
 
@@ -603,6 +736,7 @@ export async function findCodexSessions(
   let targetRoot: string | null = null;
   let targetRootAliases: ComparablePathAlias[] | null = null;
   const includeCrossSessionWrites = options.includeCrossSessionWrites === true;
+  const dateRange = buildCodexSessionFolderDateRange(options.dateFrom, options.dateTo);
 
   if (normalizedTargetDirectory !== null) {
     requestedDirectory =
@@ -628,10 +762,15 @@ export async function findCodexSessions(
         return files.map((file) => ({ file, kind: root.kind }));
       }),
     )
-  ).flat();
+  )
+    .flat()
+    .filter((entry) => codexSessionFileMatchesFolderDateRange(entry.file, dateRange));
+  const candidateSearchPaths = dateRange.active
+    ? sessionFiles.map((entry) => entry.file)
+    : sessionRoots.map((root) => root.directory);
   const candidateFiles = targetRootAliases
     ? await findCandidateSessionFiles(
-        sessionRoots.map((root) => root.directory),
+        candidateSearchPaths,
         sessionFiles.map((entry) => entry.file),
         targetRootAliases,
       )
@@ -705,6 +844,7 @@ export async function getSessionDetailMetrics(
     return {
       interactionCount: 0,
       toolCallCount: 0,
+      tokenUsage: null,
       fileSizeBytes,
       analysisKind: "skipped",
       skipReason: `Automatic analysis is disabled for sessions larger than ${formatByteCount(AUTO_DETAIL_PARSE_LIMIT_BYTES)}. Use Analyze Anyway to run a bounded scan.`,
@@ -716,6 +856,7 @@ export async function getSessionDetailMetrics(
   let responseItemUserMessages = 0;
   let eventUserMessages = 0;
   let toolCallCount = 0;
+  let tokenUsage: SessionTokenUsage | null = null;
   let largestParsedLineBytes = 0;
   let oversizedLineCount = 0;
 
@@ -757,6 +898,8 @@ export async function getSessionDetailMetrics(
       const payload = asObject(record.payload);
       if (payload?.type === "user_message") {
         eventUserMessages += 1;
+      } else if (payload?.type === "token_count") {
+        tokenUsage = extractTotalTokenUsage(payload) ?? tokenUsage;
       }
     }
   }
@@ -765,6 +908,7 @@ export async function getSessionDetailMetrics(
     interactionCount:
       responseItemUserMessages > 0 ? responseItemUserMessages : eventUserMessages,
     toolCallCount,
+    tokenUsage,
     fileSizeBytes,
     analysisKind: oversizedLineCount > 0 ? "partial" : "full",
     skipReason:
@@ -773,6 +917,87 @@ export async function getSessionDetailMetrics(
         : null,
     largestParsedLineBytes: largestParsedLineBytes > 0 ? largestParsedLineBytes : null,
     oversizedLineCount,
+  };
+}
+
+export async function readSessionTokenUsage(
+  inputPath: string,
+  options: ReadSessionTokenUsageOptions = {},
+): Promise<ReadSessionTokenUsageResult> {
+  const sessionFilePath = resolveFilesystemPath(inputPath);
+  let fileSizeBytes = 0;
+  try {
+    fileSizeBytes = (await fs.stat(sessionFilePath)).size;
+  } catch {
+    throw new Error(`Session file not found: ${sessionFilePath}`);
+  }
+
+  let tokenUsage: SessionTokenUsage | null = null;
+  let tokenCountRows = 0;
+  let oversizedLineCount = 0;
+  let lastProgressBytes = 0;
+
+  for await (const event of streamJsonlLines(sessionFilePath, {
+    signal: options.signal,
+    maxLineBytes: MAX_JSONL_LINE_BYTES_HARD,
+    oversizedStrategy: "emit",
+    requiredLineContent: TOKEN_COUNT_LINE_NEEDLE,
+  })) {
+    if (event.kind === "oversized") {
+      oversizedLineCount += 1;
+      lastProgressBytes = await maybeReportTokenScanProgress(
+        options,
+        event.bytesProcessed,
+        fileSizeBytes,
+        lastProgressBytes,
+      );
+      continue;
+    }
+
+    if (event.kind === "skipped") {
+      lastProgressBytes = await maybeReportTokenScanProgress(
+        options,
+        event.bytesProcessed,
+        fileSizeBytes,
+        lastProgressBytes,
+      );
+      continue;
+    }
+
+    try {
+      const record = JSON.parse(event.line.trim()) as JsonlRecord;
+      if (record.type === "event_msg") {
+        const payload = asObject(record.payload);
+        if (payload?.type === "token_count") {
+          const nextTokenUsage = extractTotalTokenUsage(payload);
+          if (nextTokenUsage) {
+            tokenUsage = nextTokenUsage;
+            tokenCountRows += 1;
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed token-count candidates so one bad row does not block a summary.
+    }
+
+    lastProgressBytes = await maybeReportTokenScanProgress(
+      options,
+      event.bytesProcessed,
+      fileSizeBytes,
+      lastProgressBytes,
+    );
+  }
+
+  await options.onProgress?.({
+    bytesProcessed: fileSizeBytes,
+    fileSizeBytes,
+  });
+
+  return {
+    tokenUsage,
+    fileSizeBytes,
+    oversizedLineCount,
+    tokenCountRows,
   };
 }
 
@@ -1417,6 +1642,31 @@ async function maybeReportByteProgress(
   return bytesProcessed;
 }
 
+async function maybeReportTokenScanProgress(
+  options: ReadSessionTokenUsageOptions,
+  bytesProcessed: number,
+  fileSizeBytes: number,
+  lastProgressBytes: number,
+): Promise<number> {
+  if (
+    !options.onProgress ||
+    (bytesProcessed !== fileSizeBytes &&
+      bytesProcessed - lastProgressBytes < EXPORT_PROGRESS_PULSE_BYTES)
+  ) {
+    return lastProgressBytes;
+  }
+
+  throwIfExportCancelled(options.signal);
+  await options.onProgress({
+    bytesProcessed,
+    fileSizeBytes,
+  });
+  throwIfExportCancelled(options.signal);
+  await yieldForExportLoop();
+
+  return bytesProcessed;
+}
+
 function buildHtmlExportPrefix(
   sessionFilePath: string,
   sessionMeta: SessionExportMetadata,
@@ -1961,7 +2211,7 @@ async function fileContainsAnyNeedle(
     maxLineBytes: MAX_JSONL_LINE_BYTES_SOFT,
     oversizedStrategy: "emit",
   })) {
-    if (event.kind === "oversized") {
+    if (event.kind !== "line") {
       continue;
     }
 
@@ -3296,6 +3546,38 @@ function asObject(value: unknown): Record<string, unknown> | null {
   }
 
   return value as Record<string, unknown>;
+}
+
+function extractTotalTokenUsage(payload: Record<string, unknown>): SessionTokenUsage | null {
+  const info = asObject(payload.info);
+  const usage = asObject(info?.total_token_usage);
+  if (!usage) {
+    return null;
+  }
+
+  const inputTokens = asNonNegativeInteger(usage.input_tokens);
+  const cachedInputTokens = asNonNegativeInteger(usage.cached_input_tokens) ?? 0;
+  const outputTokens = asNonNegativeInteger(usage.output_tokens);
+  const reasoningOutputTokens = asNonNegativeInteger(usage.reasoning_output_tokens) ?? 0;
+  const totalTokens = asNonNegativeInteger(usage.total_tokens);
+
+  if (inputTokens === null || outputTokens === null || totalTokens === null) {
+    return null;
+  }
+
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens,
+  };
+}
+
+function asNonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.trunc(value)
+    : null;
 }
 
 function formatTimestamp(value: unknown): string {

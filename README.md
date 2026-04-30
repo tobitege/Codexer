@@ -26,6 +26,12 @@ If you are working in this repo, use `bun install` instead of `npm install` or `
   <img src="./codlogs-export-options.png" alt="codlogs" width="500">
 </p>
 
+<p align="center">
+  <img src="./codlogs-token-summary.png" alt="codlogs filtered token summary" width="500">
+</p>
+
+The desktop app can summarize token usage for the currently filtered sessions, including cached input, uncached input, output, reasoning output, and the number of token-count rows scanned.
+
 ## CLI
 
 Install it globally from this folder:
@@ -100,6 +106,7 @@ Current desktop app highlights:
 - scans live and archived Codex sessions from `~/.codex` or `%CODEX_HOME%`
 - filters by current folder tree or repo root and can include cross-session writes
 - exports the selected session to Markdown or HTML
+- summarizes token usage for one selected session or all currently filtered sessions
 - shows a collapsible environment status section for:
   - Codex home read/write access
   - `git` availability

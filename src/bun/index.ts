@@ -13,8 +13,15 @@ import {
   findCodexSessions,
   getSessionDetailMetrics,
   readSessionTranscript,
+  readSessionTokenUsage,
+  type SessionTokenUsage,
 } from "../shared/codlogs-core.ts";
-import type { CodexerRPC, EnvironmentCapabilities } from "../shared/rpc.ts";
+import type {
+  CodexerRPC,
+  EnvironmentCapabilities,
+  TokenUsageSummaryJobStatus,
+  TokenUsageSummaryResult,
+} from "../shared/rpc.ts";
 import {
   buildCodexCurrentDayRolloutPath,
   generateUuidV7String,
@@ -111,6 +118,11 @@ type SanitizedCopyJobRecord = {
   status: ExportJobStatus;
 };
 
+type TokenUsageSummaryJobRecord = {
+  controller: AbortController;
+  status: TokenUsageSummaryJobStatus;
+};
+
 type SessionMetaRecord = {
   timestamp?: string;
   type: string;
@@ -126,6 +138,7 @@ type SessionIndexRecord = {
 const EXPORT_JOB_RETENTION_MS = 5 * 60 * 1000;
 const exportJobs = new Map<string, ExportJobRecord>();
 const sanitizedCopyJobs = new Map<string, SanitizedCopyJobRecord>();
+const tokenUsageSummaryJobs = new Map<string, TokenUsageSummaryJobRecord>();
 const DEFAULT_WINDOW_FRAME = {
   width: 1600,
   height: 1000,
@@ -174,6 +187,23 @@ function getSanitizedCopyJobStatus(jobId: string): ExportJobStatus {
   return sanitizedCopyJobs.get(jobId)?.status ?? getMissingSanitizedCopyJobStatus();
 }
 
+function getMissingTokenUsageSummaryJobStatus(): TokenUsageSummaryJobStatus {
+  return {
+    kind: "error",
+    progressPercent: 0,
+    stage: "missing",
+    message: "The token summary job is no longer available.",
+    scannedSessionCount: 0,
+    totalSessionCount: 0,
+    currentSessionPath: null,
+    result: null,
+  };
+}
+
+function getTokenUsageSummaryJobStatus(jobId: string): TokenUsageSummaryJobStatus {
+  return tokenUsageSummaryJobs.get(jobId)?.status ?? getMissingTokenUsageSummaryJobStatus();
+}
+
 function setExportJobStatus(jobId: string, status: ExportJobStatus): void {
   const existing = exportJobs.get(jobId);
   if (!existing) {
@@ -185,6 +215,18 @@ function setExportJobStatus(jobId: string, status: ExportJobStatus): void {
 
 function setSanitizedCopyJobStatus(jobId: string, status: ExportJobStatus): void {
   const existing = sanitizedCopyJobs.get(jobId);
+  if (!existing) {
+    return;
+  }
+
+  existing.status = status;
+}
+
+function setTokenUsageSummaryJobStatus(
+  jobId: string,
+  status: TokenUsageSummaryJobStatus,
+): void {
+  const existing = tokenUsageSummaryJobs.get(jobId);
   if (!existing) {
     return;
   }
@@ -472,6 +514,187 @@ function cancelExportJob(jobId: string): { ok: boolean } {
     message: "Cancelling export...",
   };
   return { ok: true };
+}
+
+function createEmptyTokenUsage(): SessionTokenUsage {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
+  };
+}
+
+function addTokenUsage(
+  target: SessionTokenUsage,
+  source: SessionTokenUsage,
+): SessionTokenUsage {
+  return {
+    inputTokens: target.inputTokens + source.inputTokens,
+    cachedInputTokens: target.cachedInputTokens + source.cachedInputTokens,
+    outputTokens: target.outputTokens + source.outputTokens,
+    reasoningOutputTokens: target.reasoningOutputTokens + source.reasoningOutputTokens,
+    totalTokens: target.totalTokens + source.totalTokens,
+  };
+}
+
+function scheduleTokenUsageSummaryJobCleanup(jobId: string): void {
+  setTimeout(() => {
+    tokenUsageSummaryJobs.delete(jobId);
+  }, EXPORT_JOB_RETENTION_MS);
+}
+
+function cancelTokenUsageSummaryJob(jobId: string): { ok: boolean } {
+  const existing = tokenUsageSummaryJobs.get(jobId);
+  if (!existing || existing.status.kind !== "working") {
+    return { ok: false };
+  }
+
+  existing.controller.abort();
+  existing.status = {
+    ...existing.status,
+    message: "Cancelling token summary...",
+  };
+  return { ok: true };
+}
+
+function startTokenUsageSummaryJob(options: {
+  sessionFilePaths: string[];
+}): { jobId: string } {
+  const sessionFilePaths = Array.from(new Set(options.sessionFilePaths));
+  const jobId = crypto.randomUUID();
+  const controller = new AbortController();
+  tokenUsageSummaryJobs.set(jobId, {
+    controller,
+    status: {
+      kind: "working",
+      progressPercent: 1,
+      stage: "starting",
+      message: `Preparing ${sessionFilePaths.length} session${sessionFilePaths.length === 1 ? "" : "s"}...`,
+      scannedSessionCount: 0,
+      totalSessionCount: sessionFilePaths.length,
+      currentSessionPath: null,
+      result: null,
+    },
+  });
+
+  void (async () => {
+    const tokenUsage = createEmptyTokenUsage();
+    let scannedSessionCount = 0;
+    let sessionsWithTokenUsage = 0;
+    let sessionsWithoutTokenUsage = 0;
+    let failedSessionCount = 0;
+    let fileSizeBytes = 0;
+    let oversizedLineCount = 0;
+    let tokenCountRows = 0;
+
+    try {
+      for (let index = 0; index < sessionFilePaths.length; index += 1) {
+        throwIfAborted(controller.signal);
+        const sessionFilePath = sessionFilePaths[index] ?? "";
+        const currentSessionLabel = path.basename(sessionFilePath);
+
+        setTokenUsageSummaryJobStatus(jobId, {
+          kind: "working",
+          progressPercent: Math.max(
+            2,
+            Math.round((index / Math.max(sessionFilePaths.length, 1)) * 96),
+          ),
+          stage: "scanning",
+          message: `Scanning ${currentSessionLabel}...`,
+          scannedSessionCount,
+          totalSessionCount: sessionFilePaths.length,
+          currentSessionPath: sessionFilePath,
+          result: null,
+        });
+
+        try {
+          const result = await readSessionTokenUsage(sessionFilePath, {
+            signal: controller.signal,
+            onProgress: (progress) => {
+              const currentFileProgress =
+                progress.bytesProcessed / Math.max(progress.fileSizeBytes, 1);
+              const progressRatio =
+                (index + Math.min(1, currentFileProgress)) /
+                Math.max(sessionFilePaths.length, 1);
+              setTokenUsageSummaryJobStatus(jobId, {
+                kind: "working",
+                progressPercent: Math.max(2, Math.min(98, Math.round(progressRatio * 98))),
+                stage: "scanning",
+                message: `Scanning ${currentSessionLabel}...`,
+                scannedSessionCount,
+                totalSessionCount: sessionFilePaths.length,
+                currentSessionPath: sessionFilePath,
+                result: null,
+              });
+            },
+          });
+
+          scannedSessionCount += 1;
+          fileSizeBytes += result.fileSizeBytes;
+          oversizedLineCount += result.oversizedLineCount;
+          tokenCountRows += result.tokenCountRows;
+          if (result.tokenUsage) {
+            const nextTokenUsage = addTokenUsage(tokenUsage, result.tokenUsage);
+            Object.assign(tokenUsage, nextTokenUsage);
+            sessionsWithTokenUsage += 1;
+          } else {
+            sessionsWithoutTokenUsage += 1;
+          }
+        } catch (error) {
+          throwIfAborted(controller.signal);
+          failedSessionCount += 1;
+          scannedSessionCount += 1;
+        }
+      }
+
+      const result: TokenUsageSummaryResult = {
+        sessionCount: sessionFilePaths.length,
+        scannedSessionCount,
+        sessionsWithTokenUsage,
+        sessionsWithoutTokenUsage,
+        failedSessionCount,
+        fileSizeBytes,
+        oversizedLineCount,
+        tokenCountRows,
+        tokenUsage,
+      };
+
+      setTokenUsageSummaryJobStatus(jobId, {
+        kind: "success",
+        progressPercent: 100,
+        stage: "done",
+        message: `Summarized ${sessionsWithTokenUsage} session${sessionsWithTokenUsage === 1 ? "" : "s"} with token data.`,
+        scannedSessionCount,
+        totalSessionCount: sessionFilePaths.length,
+        currentSessionPath: null,
+        result,
+      });
+    } catch (error) {
+      if (wasExportCancelled(error)) {
+        setTokenUsageSummaryJobStatus(jobId, {
+          ...getTokenUsageSummaryJobStatus(jobId),
+          kind: "cancelled",
+          stage: "cancelled",
+          message: "Token summary cancelled.",
+          currentSessionPath: null,
+        });
+      } else {
+        setTokenUsageSummaryJobStatus(jobId, {
+          ...getTokenUsageSummaryJobStatus(jobId),
+          kind: "error",
+          stage: "error",
+          message: asErrorMessage(error),
+          currentSessionPath: null,
+        });
+      }
+    } finally {
+      scheduleTokenUsageSummaryJobCleanup(jobId);
+    }
+  })();
+
+  return { jobId };
 }
 
 async function getSettingsFilePath(): Promise<string> {
@@ -1255,12 +1478,16 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
         codexHome,
         targetDirectory,
         cwdOnly,
+        dateFrom,
+        dateTo,
         includeCrossSessionWrites,
       }) =>
         findCodexSessions({
           codexHome,
           targetDirectory,
           cwdOnly,
+          dateFrom,
+          dateTo,
           includeCrossSessionWrites,
           currentWorkingDirectory: currentWorkingDirectoryPreference,
         }).then(async (result) => {
@@ -1429,10 +1656,18 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
           createJsonlCopy,
           reAddToCurrentDay,
         }),
+      startTokenUsageSummary: async ({ sessionFilePaths }) =>
+        startTokenUsageSummaryJob({
+          sessionFilePaths,
+        }),
       getExportJobStatus: async ({ jobId }) => getExportJobStatus(jobId),
       getSanitizedCopyJobStatus: async ({ jobId }) => getSanitizedCopyJobStatus(jobId),
+      getTokenUsageSummaryJobStatus: async ({ jobId }) =>
+        getTokenUsageSummaryJobStatus(jobId),
       cancelExportJob: async ({ jobId }) => cancelExportJob(jobId),
       cancelSanitizedCopyJob: async ({ jobId }) => cancelSanitizedCopyJob(jobId),
+      cancelTokenUsageSummaryJob: async ({ jobId }) =>
+        cancelTokenUsageSummaryJob(jobId),
       revealPath: ({ path: targetPath }) => {
         Utils.showItemInFolder(targetPath);
         return { ok: true };

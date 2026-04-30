@@ -2,6 +2,7 @@ import type { RPCSchema } from "electrobun/view";
 import type {
   FindCodexSessionsResult,
   SessionDetailMetrics,
+  SessionTokenUsage,
   SessionTranscriptResult,
 } from "./codlogs-core.ts";
 
@@ -16,6 +17,29 @@ export type EnvironmentCapabilities = {
   notes: string[];
 };
 
+export type TokenUsageSummaryResult = {
+  sessionCount: number;
+  scannedSessionCount: number;
+  sessionsWithTokenUsage: number;
+  sessionsWithoutTokenUsage: number;
+  failedSessionCount: number;
+  fileSizeBytes: number;
+  oversizedLineCount: number;
+  tokenCountRows: number;
+  tokenUsage: SessionTokenUsage;
+};
+
+export type TokenUsageSummaryJobStatus = {
+  kind: "working" | "success" | "error" | "cancelled";
+  progressPercent: number;
+  stage: string;
+  message: string;
+  scannedSessionCount: number;
+  totalSessionCount: number;
+  currentSessionPath: string | null;
+  result: TokenUsageSummaryResult | null;
+};
+
 export type CodexerRPC = {
   bun: RPCSchema<{
     requests: {
@@ -24,6 +48,8 @@ export type CodexerRPC = {
           codexHome: string | null;
           targetDirectory: string | null;
           cwdOnly: boolean;
+          dateFrom: string | null;
+          dateTo: string | null;
           includeCrossSessionWrites: boolean;
         };
         response: FindCodexSessionsResult;
@@ -134,6 +160,14 @@ export type CodexerRPC = {
           jobId: string;
         };
       };
+      startTokenUsageSummary: {
+        params: {
+          sessionFilePaths: string[];
+        };
+        response: {
+          jobId: string;
+        };
+      };
       getExportJobStatus: {
         params: {
           jobId: string;
@@ -158,6 +192,12 @@ export type CodexerRPC = {
           outputPath: string | null;
         };
       };
+      getTokenUsageSummaryJobStatus: {
+        params: {
+          jobId: string;
+        };
+        response: TokenUsageSummaryJobStatus;
+      };
       cancelExportJob: {
         params: {
           jobId: string;
@@ -167,6 +207,14 @@ export type CodexerRPC = {
         };
       };
       cancelSanitizedCopyJob: {
+        params: {
+          jobId: string;
+        };
+        response: {
+          ok: boolean;
+        };
+      };
+      cancelTokenUsageSummaryJob: {
         params: {
           jobId: string;
         };

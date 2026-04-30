@@ -12,10 +12,16 @@ import type {
   FindCodexSessionsResult,
   SessionDetailMetrics,
   SessionMetaMatch,
+  SessionTokenUsage,
   SessionTranscriptEntry,
   SessionTranscriptResult,
 } from "../shared/codlogs-core.ts";
-import type { CodexerRPC, EnvironmentCapabilities } from "../shared/rpc.ts";
+import type {
+  CodexerRPC,
+  EnvironmentCapabilities,
+  TokenUsageSummaryJobStatus,
+  TokenUsageSummaryResult,
+} from "../shared/rpc.ts";
 import { sanitizeSessionTitleInput } from "../shared/session-title.ts";
 
 type BrowseMode = "all" | "folder";
@@ -25,6 +31,8 @@ type AppliedQuery = {
   targetDirectory: string | null;
   cwdOnly: boolean;
   includeCrossSessionWrites: boolean;
+  dateFrom: string;
+  dateTo: string;
 };
 
 type ExportState = {
@@ -63,6 +71,16 @@ type RenameDialogState = {
   title: string;
 };
 
+type TokenUsageSummaryDialogState = {
+  sessionFilePaths: string[];
+  sessionCount: number;
+  fileSizeBytes: number;
+};
+
+type TokenUsageSummaryState =
+  | { kind: "idle" }
+  | TokenUsageSummaryJobStatus;
+
 type SessionBrowserState =
   | { kind: "idle" }
   | {
@@ -96,6 +114,7 @@ const timestampFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "short",
 });
+const tokenCountFormatter = new Intl.NumberFormat(undefined);
 
 const LARGE_SESSION_WARNING_BYTES = 64 * 1024 * 1024;
 const RPC_MAX_REQUEST_TIME_MS = 15 * 60 * 1000;
@@ -196,6 +215,51 @@ function formatFileSize(value: number | null): string {
   }
 
   return `${size >= 100 ? size.toFixed(0) : size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function formatTokenCount(value: number): string {
+  return tokenCountFormatter.format(value);
+}
+
+function getUncachedInputTokens(tokenUsage: SessionTokenUsage): number {
+  return Math.max(0, tokenUsage.inputTokens - tokenUsage.cachedInputTokens);
+}
+
+function formatTokenUsageForClipboard(
+  sessionTitle: string,
+  tokenUsage: SessionTokenUsage,
+): string {
+  return [
+    `Session: ${sessionTitle}`,
+    `Total tokens: ${tokenUsage.totalTokens}`,
+    `Input tokens: ${tokenUsage.inputTokens}`,
+    `Cached input tokens: ${tokenUsage.cachedInputTokens}`,
+    `Uncached input tokens: ${getUncachedInputTokens(tokenUsage)}`,
+    `Output tokens: ${tokenUsage.outputTokens}`,
+    `Reasoning output tokens: ${tokenUsage.reasoningOutputTokens}`,
+  ].join("\n");
+}
+
+function formatTokenUsageSummaryForClipboard(
+  summary: TokenUsageSummaryResult,
+): string {
+  return [
+    "Filtered sessions token summary",
+    `Sessions: ${summary.sessionCount}`,
+    `Scanned sessions: ${summary.scannedSessionCount}`,
+    `Sessions with token usage: ${summary.sessionsWithTokenUsage}`,
+    `Sessions without token usage: ${summary.sessionsWithoutTokenUsage}`,
+    `Failed sessions: ${summary.failedSessionCount}`,
+    `Total file size: ${summary.fileSizeBytes}`,
+    `Oversized JSONL rows: ${summary.oversizedLineCount}`,
+    "",
+    `Total tokens: ${summary.tokenUsage.totalTokens}`,
+    `Input tokens: ${summary.tokenUsage.inputTokens}`,
+    `Cached input tokens: ${summary.tokenUsage.cachedInputTokens}`,
+    `Uncached input tokens: ${getUncachedInputTokens(summary.tokenUsage)}`,
+    `Output tokens: ${summary.tokenUsage.outputTokens}`,
+    `Reasoning output tokens: ${summary.tokenUsage.reasoningOutputTokens}`,
+  ].join("\n");
 }
 
 function formatInteractionSummary(
@@ -403,7 +467,11 @@ function App() {
     targetDirectory: "",
     cwdOnly: false,
     includeCrossSessionWrites: false,
+    dateFrom: "",
+    dateTo: "",
   });
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [showLiveSessions, setShowLiveSessions] = useState(true);
   const [showArchivedSessions, setShowArchivedSessions] = useState(true);
@@ -447,6 +515,11 @@ function App() {
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(null);
   const [sanitizedCopyDialog, setSanitizedCopyDialog] =
     useState<SanitizedCopyDialogState | null>(null);
+  const [showTokenUsageDialog, setShowTokenUsageDialog] = useState(false);
+  const [tokenUsageSummaryDialog, setTokenUsageSummaryDialog] =
+    useState<TokenUsageSummaryDialogState | null>(null);
+  const [tokenUsageSummaryState, setTokenUsageSummaryState] =
+    useState<TokenUsageSummaryState>({ kind: "idle" });
   const [sessionBrowser, setSessionBrowser] = useState<SessionBrowserState>({ kind: "idle" });
   const sessionBrowserRequestIdRef = useRef(0);
   const codexHomeRef = useRef(codexHome);
@@ -456,11 +529,15 @@ function App() {
   const environmentRequestIdRef = useRef(0);
   const exportRequestIdRef = useRef(0);
   const sanitizedCopyRequestIdRef = useRef(0);
+  const tokenUsageSummaryRequestIdRef = useRef(0);
   const activeExportJobIdRef = useRef<string | null>(null);
   const activeSanitizedCopyJobIdRef = useRef<string | null>(null);
+  const activeTokenUsageSummaryJobIdRef = useRef<string | null>(null);
   const initialWindowRefreshDoneRef = useRef(false);
   const [exportCancelPending, setExportCancelPending] = useState(false);
   const [sanitizedCopyCancelPending, setSanitizedCopyCancelPending] = useState(false);
+  const [tokenUsageSummaryCancelPending, setTokenUsageSummaryCancelPending] =
+    useState(false);
   const [renameSessionPending, setRenameSessionPending] = useState(false);
 
   const deferredSearchQuery = useDeferredValue(searchQuery);
@@ -571,6 +648,8 @@ function App() {
 
     return matchesSearch(session, deferredSearchQuery);
   });
+  const filteredLiveCount = filteredSessions.filter((session) => session.kind === "live").length;
+  const filteredArchivedCount = filteredSessions.length - filteredLiveCount;
   const activeSession =
     filteredSessions.find((session) => session.file === selectedFile) ??
     filteredSessions[0] ??
@@ -702,6 +781,8 @@ function App() {
     nextBrowseMode: BrowseMode,
     nextCwdOnly = cwdOnly,
     nextIncludeCrossSessionWrites = includeCrossSessionWrites,
+    nextDateFrom = dateFrom,
+    nextDateTo = dateTo,
   ): Promise<void> {
     const requestId = loadRequestIdRef.current + 1;
     loadRequestIdRef.current = requestId;
@@ -713,6 +794,8 @@ function App() {
         codexHome: codexHome.trim() || null,
         targetDirectory,
         cwdOnly: nextCwdOnly,
+        dateFrom: nextDateFrom || null,
+        dateTo: nextDateTo || null,
         includeCrossSessionWrites: nextIncludeCrossSessionWrites,
       });
 
@@ -726,6 +809,8 @@ function App() {
         targetDirectory,
         cwdOnly: nextCwdOnly,
         includeCrossSessionWrites: nextIncludeCrossSessionWrites,
+        dateFrom: nextDateFrom,
+        dateTo: nextDateTo,
       });
       if (!codexHomeRef.current.trim()) {
         setCodexHome(nextResult.codexHome);
@@ -768,7 +853,7 @@ function App() {
       }
 
       setFolderPath(path);
-      void loadSessions(path, "folder", cwdOnly, includeCrossSessionWrites);
+      void loadSessions(path, "folder", cwdOnly, includeCrossSessionWrites, dateFrom, dateTo);
     } catch (pickError) {
       setError(asErrorMessage(pickError));
     }
@@ -872,6 +957,8 @@ function App() {
         appliedQuery.browseMode,
         appliedQuery.cwdOnly,
         appliedQuery.includeCrossSessionWrites,
+        appliedQuery.dateFrom,
+        appliedQuery.dateTo,
       );
     } catch (renameError) {
       setError(asErrorMessage(renameError));
@@ -1132,6 +1219,8 @@ function App() {
               appliedQuery.browseMode,
               appliedQuery.cwdOnly,
               appliedQuery.includeCrossSessionWrites,
+              appliedQuery.dateFrom,
+              appliedQuery.dateTo,
             );
           }
           return;
@@ -1186,6 +1275,139 @@ function App() {
     }
   }
 
+  function openTokenUsageSummaryDialog(): void {
+    if (filteredSessions.length === 0 || tokenUsageSummaryState.kind === "working") {
+      return;
+    }
+
+    setTokenUsageSummaryState({ kind: "idle" });
+    setTokenUsageSummaryCancelPending(false);
+    setTokenUsageSummaryDialog({
+      sessionFilePaths: filteredSessions.map((session) => session.file),
+      sessionCount: filteredSessions.length,
+      fileSizeBytes: filteredSessions.reduce(
+        (total, session) => total + session.fileSizeBytes,
+        0,
+      ),
+    });
+  }
+
+  function closeTokenUsageSummaryDialog(): void {
+    if (tokenUsageSummaryState.kind === "working") {
+      return;
+    }
+
+    tokenUsageSummaryRequestIdRef.current += 1;
+    activeTokenUsageSummaryJobIdRef.current = null;
+    setTokenUsageSummaryCancelPending(false);
+    setTokenUsageSummaryDialog(null);
+    setTokenUsageSummaryState({ kind: "idle" });
+  }
+
+  async function startTokenUsageSummary(): Promise<void> {
+    if (!tokenUsageSummaryDialog || tokenUsageSummaryState.kind === "working") {
+      return;
+    }
+
+    const requestId = tokenUsageSummaryRequestIdRef.current + 1;
+    tokenUsageSummaryRequestIdRef.current = requestId;
+    activeTokenUsageSummaryJobIdRef.current = null;
+    setTokenUsageSummaryCancelPending(false);
+    setTokenUsageSummaryState({
+      kind: "working",
+      progressPercent: 1,
+      stage: "starting",
+      message: `Preparing ${tokenUsageSummaryDialog.sessionCount} session${tokenUsageSummaryDialog.sessionCount === 1 ? "" : "s"}...`,
+      scannedSessionCount: 0,
+      totalSessionCount: tokenUsageSummaryDialog.sessionCount,
+      currentSessionPath: null,
+      result: null,
+    });
+
+    try {
+      const { jobId } = await getRpc().request.startTokenUsageSummary({
+        sessionFilePaths: tokenUsageSummaryDialog.sessionFilePaths,
+      });
+      activeTokenUsageSummaryJobIdRef.current = jobId;
+
+      while (
+        requestId === tokenUsageSummaryRequestIdRef.current &&
+        activeTokenUsageSummaryJobIdRef.current
+      ) {
+        const activeJobId = activeTokenUsageSummaryJobIdRef.current;
+        if (!activeJobId) {
+          break;
+        }
+
+        const status = await getRpc().request.getTokenUsageSummaryJobStatus({
+          jobId: activeJobId,
+        });
+        if (requestId !== tokenUsageSummaryRequestIdRef.current) {
+          return;
+        }
+
+        setTokenUsageSummaryState(status);
+        if (status.kind !== "working") {
+          activeTokenUsageSummaryJobIdRef.current = null;
+          setTokenUsageSummaryCancelPending(false);
+          return;
+        }
+
+        await delay(400);
+      }
+    } catch (summaryError) {
+      if (requestId !== tokenUsageSummaryRequestIdRef.current) {
+        return;
+      }
+
+      activeTokenUsageSummaryJobIdRef.current = null;
+      setTokenUsageSummaryCancelPending(false);
+      setTokenUsageSummaryState({
+        kind: "error",
+        progressPercent: 0,
+        stage: "error",
+        message: asErrorMessage(summaryError),
+        scannedSessionCount: 0,
+        totalSessionCount: tokenUsageSummaryDialog.sessionCount,
+        currentSessionPath: null,
+        result: null,
+      });
+    }
+  }
+
+  async function cancelTokenUsageSummary(): Promise<void> {
+    const jobId = activeTokenUsageSummaryJobIdRef.current;
+    if (!jobId || tokenUsageSummaryCancelPending) {
+      return;
+    }
+
+    setTokenUsageSummaryCancelPending(true);
+    setTokenUsageSummaryState((current) =>
+      current.kind === "working"
+        ? {
+            ...current,
+            message: "Cancelling token summary...",
+          }
+        : current,
+    );
+
+    try {
+      await getRpc().request.cancelTokenUsageSummaryJob({ jobId });
+    } catch (cancelError) {
+      setTokenUsageSummaryCancelPending(false);
+      setTokenUsageSummaryState({
+        kind: "error",
+        progressPercent: 0,
+        stage: "error",
+        message: asErrorMessage(cancelError),
+        scannedSessionCount: 0,
+        totalSessionCount: tokenUsageSummaryDialog?.sessionCount ?? 0,
+        currentSessionPath: null,
+        result: null,
+      });
+    }
+  }
+
   async function revealPath(targetPath: string | null): Promise<void> {
     if (!targetPath) {
       return;
@@ -1214,7 +1436,7 @@ function App() {
   }
 
   function handleLoadAll(): void {
-    void loadSessions(null, "all", cwdOnly);
+    void loadSessions(null, "all", cwdOnly, includeCrossSessionWrites, dateFrom, dateTo);
   }
 
   function handleFilterByFolder(): void {
@@ -1223,6 +1445,8 @@ function App() {
       "folder",
       cwdOnly,
       includeCrossSessionWrites,
+      dateFrom,
+      dateTo,
     );
   }
 
@@ -1232,6 +1456,8 @@ function App() {
       appliedQuery.browseMode,
       appliedQuery.cwdOnly,
       appliedQuery.includeCrossSessionWrites,
+      appliedQuery.dateFrom,
+      appliedQuery.dateTo,
     );
   }
 
@@ -1305,10 +1531,20 @@ function App() {
             </p>
           </div>
           <div className="hero-stats">
+            <button
+              aria-label="Summarize token usage for filtered sessions"
+              className="hero-token-button"
+              disabled={loading || filteredSessions.length === 0}
+              onClick={openTokenUsageSummaryDialog}
+              title="Summarize filtered session tokens"
+              type="button"
+            >
+              <span aria-hidden="true">Σ</span>
+            </button>
             <div className="stat-card">
               <span className="stat-label">Sessions</span>
-              <span className="stat-value">{result?.sessionCount ?? 0}</span>
-              <span className="stat-detail">{result ? `${result.liveCount} live / ${result.archivedCount} archived` : "Scanning..."}</span>
+              <span className="stat-value">{result ? filteredSessions.length : 0}</span>
+              <span className="stat-detail">{result ? `${filteredLiveCount} live / ${filteredArchivedCount} archived` : "Scanning..."}</span>
             </div>
             <div className="stat-card">
               <span className="stat-label">Scope</span>
@@ -1360,6 +1596,26 @@ function App() {
               />
               <span>Cross-session writes</span>
             </label>
+            <div className="date-filter-group" aria-label="Filter sessions by date range">
+              <label className="date-filter-field">
+                <span>From</span>
+                <input
+                  type="date"
+                  value={dateFrom}
+                  max={dateTo || undefined}
+                  onChange={(event) => setDateFrom(event.target.value)}
+                />
+              </label>
+              <label className="date-filter-field">
+                <span>To</span>
+                <input
+                  type="date"
+                  value={dateTo}
+                  min={dateFrom || undefined}
+                  onChange={(event) => setDateTo(event.target.value)}
+                />
+              </label>
+            </div>
           </div>
         </section>
 
@@ -1591,6 +1847,17 @@ function App() {
                           strokeWidth="1.8"
                         />
                       </svg>
+                    </button>
+                    <button
+                      aria-label="Show token usage"
+                      className="ghost-button icon-button token-button"
+                      onClick={() => setShowTokenUsageDialog(true)}
+                      title="Token usage"
+                      type="button"
+                    >
+                      <span aria-hidden="true" className="token-button-symbol">
+                        Σ
+                      </span>
                     </button>
                     {!isCodlogsSanitizedSession && (
                       <button
@@ -1841,6 +2108,24 @@ function App() {
           reAddToCurrentDay={sanitizedCopyDialog.reAddToCurrentDay}
         />
       )}
+      {showTokenUsageDialog && activeSession && (
+        <TokenUsageDialog
+          metricsState={sessionDetailMetricsState}
+          onClose={() => setShowTokenUsageDialog(false)}
+          sessionTitle={getSessionTitle(activeSession)}
+        />
+      )}
+      {tokenUsageSummaryDialog && (
+        <TokenUsageSummaryDialog
+          cancelPending={tokenUsageSummaryCancelPending}
+          fileSizeBytes={tokenUsageSummaryDialog.fileSizeBytes}
+          onCancel={() => void cancelTokenUsageSummary()}
+          onClose={closeTokenUsageSummaryDialog}
+          onConfirm={() => void startTokenUsageSummary()}
+          sessionCount={tokenUsageSummaryDialog.sessionCount}
+          state={tokenUsageSummaryState}
+        />
+      )}
       {exportState.kind === "working" && (
         <ExportProgressDialog
           cancelPending={exportCancelPending}
@@ -1900,6 +2185,421 @@ function EnvironmentCapabilityLine(props: {
       >
         {formatAvailabilityLabel(props.available)}
       </span>
+    </div>
+  );
+}
+
+function TokenUsageDialog(props: {
+  metricsState: SessionDetailMetricsState;
+  onClose: () => void;
+  sessionTitle: string;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const tokenUsage = props.metricsState.metrics?.tokenUsage ?? null;
+
+  useEffect(() => {
+    dialogRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" && event.key !== "Esc" && event.code !== "Escape") {
+        return;
+      }
+
+      event.preventDefault();
+      props.onClose();
+    };
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [props.onClose]);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current);
+        copyResetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopy = async (): Promise<void> => {
+    if (!tokenUsage) {
+      return;
+    }
+
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(
+          formatTokenUsageForClipboard(props.sessionTitle, tokenUsage),
+        );
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+
+    setCopyState(ok ? "copied" : "failed");
+    if (copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+    }
+    copyResetTimerRef.current = setTimeout(() => {
+      setCopyState("idle");
+      copyResetTimerRef.current = null;
+    }, 1600);
+  };
+
+  const statusMessage =
+    props.metricsState.kind === "loading"
+      ? "Inspecting token counts..."
+      : props.metricsState.kind === "error"
+        ? props.metricsState.errorMessage ?? "Token usage is unavailable."
+        : props.metricsState.metrics?.analysisKind === "skipped"
+          ? "Token usage is unavailable until this session is analyzed."
+          : "No token_count rows were found in this session.";
+
+  return (
+    <div className="dialog-backdrop" onClick={props.onClose}>
+      <div
+        aria-modal="true"
+        className="export-dialog token-usage-dialog"
+        onClick={(event) => event.stopPropagation()}
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <div className="export-dialog-header">
+          <div>
+            <span className="dialog-kicker">Token usage</span>
+            <h3>{props.sessionTitle}</h3>
+            <p>Input, cached input, output, and reasoning token totals from the session log.</p>
+          </div>
+        </div>
+
+        {tokenUsage ? (
+          <div className="token-usage-grid">
+            <TokenUsageStat label="Total" value={tokenUsage.totalTokens} />
+            <TokenUsageStat label="Input" value={tokenUsage.inputTokens} />
+            <TokenUsageStat label="Cached Input" value={tokenUsage.cachedInputTokens} />
+            <TokenUsageStat
+              label="Uncached Input"
+              value={getUncachedInputTokens(tokenUsage)}
+            />
+            <TokenUsageStat
+              label="Reasoning Output"
+              value={tokenUsage.reasoningOutputTokens}
+            />
+            <TokenUsageStat label="Output" value={tokenUsage.outputTokens} />
+          </div>
+        ) : (
+          <div className="dialog-warning dialog-warning-neutral">
+            <strong>Token details unavailable</strong>
+            <p>{statusMessage}</p>
+          </div>
+        )}
+
+        <div className="dialog-actions token-dialog-actions">
+          <button
+            className="primary-button token-copy-button"
+            disabled={!tokenUsage}
+            onClick={() => void handleCopy()}
+            type="button"
+          >
+            <CopyIcon className="button-icon" />
+            <span>
+              {copyState === "copied"
+                ? "Copied"
+                : copyState === "failed"
+                  ? "Copy Failed"
+                  : "Copy"}
+            </span>
+          </button>
+          <button className="ghost-button" onClick={props.onClose} type="button">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TokenUsageSummaryDialog(props: {
+  cancelPending: boolean;
+  fileSizeBytes: number;
+  onCancel: () => void;
+  onClose: () => void;
+  onConfirm: () => void;
+  sessionCount: number;
+  state: TokenUsageSummaryState;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const isWorking = props.state.kind === "working";
+  const progressPercent =
+    props.state.kind === "idle" ? 0 : Math.max(0, Math.min(100, props.state.progressPercent));
+  const result = props.state.kind === "idle" ? null : props.state.result;
+
+  useEffect(() => {
+    dialogRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" && event.key !== "Esc" && event.code !== "Escape") {
+        return;
+      }
+
+      if (isWorking) {
+        return;
+      }
+
+      event.preventDefault();
+      props.onClose();
+    };
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [isWorking, props.onClose]);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current);
+        copyResetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopy = async (): Promise<void> => {
+    if (!result) {
+      return;
+    }
+
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(formatTokenUsageSummaryForClipboard(result));
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+
+    setCopyState(ok ? "copied" : "failed");
+    if (copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+    }
+    copyResetTimerRef.current = setTimeout(() => {
+      setCopyState("idle");
+      copyResetTimerRef.current = null;
+    }, 1600);
+  };
+
+  const scannedSessionCount =
+    props.state.kind === "idle" ? 0 : props.state.scannedSessionCount;
+  const totalSessionCount =
+    props.state.kind === "idle" ? props.sessionCount : props.state.totalSessionCount;
+  const currentSessionPath =
+    props.state.kind === "working" ? props.state.currentSessionPath : null;
+  const statusMessage =
+    props.state.kind === "idle"
+      ? "Token counts are read from every currently filtered JSONL file. Large logs can take a while."
+      : props.state.message;
+
+  return (
+    <div
+      className="dialog-backdrop"
+      onClick={() => {
+        if (!isWorking) {
+          props.onClose();
+        }
+      }}
+    >
+      <div
+        aria-modal="true"
+        className="export-dialog token-summary-dialog"
+        onClick={(event) => event.stopPropagation()}
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <div className="export-dialog-header">
+          <div>
+            <span className="dialog-kicker">Filtered tokens</span>
+            <h3>Token Summary</h3>
+            <p>{statusMessage}</p>
+          </div>
+        </div>
+
+        <div className="token-summary-progress">
+          <div className="export-progress-track" aria-hidden="true">
+            <div
+              className="export-progress-fill"
+              style={{ width: `${Math.max(2, progressPercent)}%` }}
+            />
+          </div>
+          <div className="token-summary-progress-meta">
+            <span>{Math.round(progressPercent)}%</span>
+            <span>
+              {scannedSessionCount} / {totalSessionCount} sessions
+            </span>
+          </div>
+        </div>
+
+        <div className="token-summary-stats">
+          <TokenSummaryStat label="Filtered Sessions" value={formatTokenCount(props.sessionCount)} />
+          <TokenSummaryStat label="Approx. Size" value={formatFileSize(props.fileSizeBytes)} />
+          <TokenSummaryStat
+            label="Scanned"
+            value={`${formatTokenCount(scannedSessionCount)} / ${formatTokenCount(totalSessionCount)}`}
+          />
+        </div>
+
+        {props.state.kind === "idle" && (
+          <div className="dialog-warning">
+            <strong>Run token summary?</strong>
+            <p>
+              codlogs will scan the current filtered set and sum token_count totals. You can cancel
+              the scan after it starts.
+            </p>
+          </div>
+        )}
+
+        {props.state.kind === "working" && (
+          <div className="dialog-warning dialog-warning-neutral">
+            <strong>{props.cancelPending ? "Cancelling..." : "Scanning session logs"}</strong>
+            <p>{currentSessionPath ? formatDisplayPath(currentSessionPath) : props.state.message}</p>
+          </div>
+        )}
+
+        {result && (
+          <>
+            <div className="token-usage-grid">
+              <TokenUsageStat label="Total" value={result.tokenUsage.totalTokens} />
+              <TokenUsageStat label="Input" value={result.tokenUsage.inputTokens} />
+              <TokenUsageStat
+                label="Cached Input"
+                value={result.tokenUsage.cachedInputTokens}
+              />
+              <TokenUsageStat
+                label="Uncached Input"
+                value={getUncachedInputTokens(result.tokenUsage)}
+              />
+              <TokenUsageStat
+                label="Reasoning Output"
+                value={result.tokenUsage.reasoningOutputTokens}
+              />
+              <TokenUsageStat label="Output" value={result.tokenUsage.outputTokens} />
+            </div>
+            <div className="token-summary-stats">
+              <TokenSummaryStat
+                label="With Token Data"
+                value={formatTokenCount(result.sessionsWithTokenUsage)}
+              />
+              <TokenSummaryStat
+                label="Without Token Data"
+                value={formatTokenCount(result.sessionsWithoutTokenUsage)}
+              />
+              <TokenSummaryStat
+                label="Failed"
+                value={formatTokenCount(result.failedSessionCount)}
+              />
+              <TokenSummaryStat
+                label="Token Rows"
+                value={formatTokenCount(result.tokenCountRows)}
+              />
+              <TokenSummaryStat
+                label="Oversized Rows"
+                value={formatTokenCount(result.oversizedLineCount)}
+              />
+            </div>
+          </>
+        )}
+
+        {(props.state.kind === "error" || props.state.kind === "cancelled") && (
+          <div className="dialog-warning">
+            <strong>
+              {props.state.kind === "cancelled" ? "Token summary cancelled" : "Token summary failed"}
+            </strong>
+            <p>{props.state.message}</p>
+          </div>
+        )}
+
+        <div className="dialog-actions token-dialog-actions">
+          {result ? (
+            <button
+              className="primary-button token-copy-button"
+              onClick={() => void handleCopy()}
+              type="button"
+            >
+              <CopyIcon className="button-icon" />
+              <span>
+                {copyState === "copied"
+                  ? "Copied"
+                  : copyState === "failed"
+                    ? "Copy Failed"
+                    : "Copy"}
+              </span>
+            </button>
+          ) : (
+            <span />
+          )}
+          <div className="token-summary-actions-right">
+            {props.state.kind === "idle" && (
+              <button className="ghost-button" onClick={props.onClose} type="button">
+                Cancel
+              </button>
+            )}
+            {props.state.kind === "idle" && (
+              <button className="primary-button" onClick={props.onConfirm} type="button">
+                Run Summary
+              </button>
+            )}
+            {props.state.kind === "working" && (
+              <button
+                className="ghost-button"
+                disabled={props.cancelPending}
+                onClick={props.onCancel}
+                type="button"
+              >
+                {props.cancelPending ? "Cancelling..." : "Cancel"}
+              </button>
+            )}
+            {props.state.kind !== "idle" && props.state.kind !== "working" && (
+              <button className="ghost-button" onClick={props.onClose} type="button">
+                Close
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TokenSummaryStat(props: { label: string; value: string }) {
+  return (
+    <div className="token-summary-stat">
+      <span className="meta-label">{props.label}</span>
+      <strong>{props.value}</strong>
+    </div>
+  );
+}
+
+function TokenUsageStat(props: { label: string; value: number }) {
+  return (
+    <div className="token-usage-stat">
+      <span className="meta-label">{props.label}</span>
+      <strong>{formatTokenCount(props.value)}</strong>
     </div>
   );
 }

@@ -6,7 +6,9 @@ import {
   AUTO_DETAIL_PARSE_LIMIT_BYTES,
   MAX_JSONL_LINE_BYTES_HARD,
   exportSessionJsonlToMarkdown,
+  findCodexSessions,
   getSessionDetailMetrics,
+  readSessionTokenUsage,
 } from "./codlogs-core.ts";
 import {
   buildCodexCurrentDayRolloutPath,
@@ -50,6 +52,32 @@ async function createTempDir(prefix: string): Promise<string> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   tempDirectories.push(directory);
   return directory;
+}
+
+async function writeSessionMetaFile(options: {
+  codexHome: string;
+  rootName: "sessions" | "archived_sessions";
+  folderDate: string;
+  id: string;
+  cwd: string;
+  metadataTimestamp: string;
+}): Promise<string> {
+  const [year = "0000", month = "00", day = "00"] = options.folderDate.split("-");
+  const sessionDirectory = path.join(options.codexHome, options.rootName, year, month, day);
+  const sessionPath = path.join(sessionDirectory, `${options.id}.jsonl`);
+  await fs.mkdir(sessionDirectory, { recursive: true });
+  await fs.writeFile(
+    sessionPath,
+    `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: options.id,
+        cwd: options.cwd,
+        timestamp: options.metadataTimestamp,
+      },
+    })}\n`,
+  );
+  return sessionPath;
 }
 
 describe("codex rollout naming helpers", () => {
@@ -110,6 +138,52 @@ describe("session title sanitization", () => {
   });
 });
 
+describe("session discovery filters", () => {
+  test("filters sessions by Codex folder date before metadata timestamps", async () => {
+    const tempDir = await createTempDir("codlogs-date-filter-");
+    const codexHome = path.join(tempDir, ".codex");
+    const repoPath = path.join(tempDir, "repo");
+    await fs.mkdir(repoPath, { recursive: true });
+
+    await writeSessionMetaFile({
+      codexHome,
+      rootName: "sessions",
+      folderDate: "2026-03-27",
+      id: "folder-date-match",
+      cwd: repoPath,
+      metadataTimestamp: "2026-04-30T10:00:00.000Z",
+    });
+    await writeSessionMetaFile({
+      codexHome,
+      rootName: "sessions",
+      folderDate: "2026-04-30",
+      id: "metadata-only-match",
+      cwd: repoPath,
+      metadataTimestamp: "2026-03-27T10:00:00.000Z",
+    });
+    await writeSessionMetaFile({
+      codexHome,
+      rootName: "archived_sessions",
+      folderDate: "2026-03-27",
+      id: "archived-folder-date-match",
+      cwd: repoPath,
+      metadataTimestamp: "2026-04-30T11:00:00.000Z",
+    });
+
+    const result = await findCodexSessions({
+      codexHome,
+      currentWorkingDirectory: repoPath,
+      dateFrom: "2026-03-27",
+      dateTo: "2026-03-27",
+    });
+
+    expect(result.sessions.map((session) => session.id).sort()).toEqual([
+      "archived-folder-date-match",
+      "folder-date-match",
+    ]);
+  });
+});
+
 describe("large-session hardening", () => {
   test("skips automatic detail analysis for oversized files", async () => {
     const tempDir = await createTempDir("codlogs-large-session-");
@@ -125,6 +199,99 @@ describe("large-session hardening", () => {
     expect(metrics.skipReason).toContain("Automatic analysis is disabled");
     expect(metrics.interactionCount).toBe(0);
     expect(metrics.toolCallCount).toBe(0);
+    expect(metrics.tokenUsage).toBeNull();
+  });
+
+  test("returns the latest cumulative token usage from token count rows", async () => {
+    const tempDir = await createTempDir("codlogs-token-usage-");
+    const sessionPath = path.join(tempDir, "token-usage.jsonl");
+
+    const userMessage = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hello" }],
+      },
+      timestamp: "2026-03-14T12:00:00.000Z",
+    });
+    const tokenCount = JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 40657493,
+            cached_input_tokens: 38628608,
+            output_tokens: 138294,
+            reasoning_output_tokens: 56128,
+            total_tokens: 40795787,
+          },
+        },
+      },
+      timestamp: "2026-03-14T12:01:00.000Z",
+    });
+
+    await fs.writeFile(sessionPath, `${userMessage}\n${tokenCount}\n`);
+
+    const metrics = await getSessionDetailMetrics(sessionPath);
+
+    expect(metrics.interactionCount).toBe(1);
+    expect(metrics.tokenUsage).toEqual({
+      inputTokens: 40657493,
+      cachedInputTokens: 38628608,
+      outputTokens: 138294,
+      reasoningOutputTokens: 56128,
+      totalTokens: 40795787,
+    });
+  });
+
+  test("scans token usage without parsing unrelated transcript rows", async () => {
+    const tempDir = await createTempDir("codlogs-token-scan-");
+    const sessionPath = path.join(tempDir, "token-scan.jsonl");
+
+    const unrelatedRow = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        output: "x".repeat(1024),
+      },
+    });
+    const tokenCount = JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 12,
+            reasoning_output_tokens: 5,
+            total_tokens: 112,
+          },
+        },
+      },
+    });
+
+    await fs.writeFile(sessionPath, `${unrelatedRow}\n${tokenCount}\n`);
+
+    const progressEvents: number[] = [];
+    const result = await readSessionTokenUsage(sessionPath, {
+      onProgress: (progress) => {
+        progressEvents.push(progress.bytesProcessed);
+      },
+    });
+
+    expect(result.tokenCountRows).toBe(1);
+    expect(result.oversizedLineCount).toBe(0);
+    expect(result.tokenUsage).toEqual({
+      inputTokens: 100,
+      cachedInputTokens: 40,
+      outputTokens: 12,
+      reasoningOutputTokens: 5,
+      totalTokens: 112,
+    });
+    expect(progressEvents.at(-1)).toBe(result.fileSizeBytes);
   });
 
   test("returns partial detail metrics when a row exceeds the bounded line limit", async () => {

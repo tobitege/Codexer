@@ -194,7 +194,36 @@ code,
 
 .hero-stats {
   display: flex;
+  align-items: stretch;
   gap: 1.5rem;
+}
+
+.hero-token-button {
+  align-self: center;
+  width: 3.2rem;
+  height: 3.2rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--color-secondary);
+  box-shadow: var(--shadow-sm);
+  font-family: var(--font-serif);
+  font-size: 1.7rem;
+  font-weight: 700;
+  line-height: 1;
+  transition: transform 0.15s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.hero-token-button:hover {
+  transform: translateY(-1px);
+  background: white;
+  border-color: rgba(53, 123, 132, 0.34);
+}
+
+.hero-token-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+  transform: none;
 }
 
 .stat-card {
@@ -369,6 +398,13 @@ code,
 .button-icon {
   width: 1.2rem;
   height: 1.2rem;
+}
+
+.token-button-symbol {
+  font-family: var(--font-serif);
+  font-size: 1.28rem;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .content-grid {
@@ -702,6 +738,42 @@ code,
   accent-color: var(--color-accent);
 }
 
+.date-filter-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.date-filter-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.date-filter-field span {
+  color: var(--color-text-muted);
+}
+
+.date-filter-field input {
+  height: 2.15rem;
+  min-width: 9.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-card-bg);
+  color: var(--color-text);
+  padding: 0 0.7rem;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.date-filter-field input:focus {
+  border-color: var(--color-secondary);
+  box-shadow: 0 0 0 3px rgba(53, 123, 132, 0.1);
+}
+
 .status-banner {
   display: flex;
   justify-content: space-between;
@@ -1025,6 +1097,87 @@ code,
 
 .rename-session-dialog {
   width: min(100%, 560px);
+}
+
+.token-usage-dialog {
+  width: min(100%, 620px);
+}
+
+.token-summary-dialog {
+  width: min(100%, 760px);
+}
+
+.token-summary-progress {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.token-summary-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.token-summary-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 0.75rem;
+}
+
+.token-summary-stat {
+  padding: 0.85rem 0.95rem;
+  border: 1px solid rgba(99, 82, 58, 0.14);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.token-summary-stat strong {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 1rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.token-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.token-usage-stat {
+  padding: 1rem;
+  border: 1px solid rgba(99, 82, 58, 0.14);
+  border-radius: 0.9rem;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.token-usage-stat strong {
+  display: block;
+  margin-top: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 1.15rem;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.token-copy-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.token-dialog-actions {
+  justify-content: space-between;
+}
+
+.token-summary-actions-right {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
 }
 
 .dialog-option {
@@ -1494,6 +1647,16 @@ code,
     flex-direction: column;
     align-items: stretch;
   }
+  .date-filter-group {
+    width: 100%;
+  }
+  .date-filter-field {
+    flex: 1 1 12rem;
+  }
+  .date-filter-field input {
+    flex: 1;
+    min-width: 0;
+  }
   .panel-header-title {
     flex-wrap: wrap;
   }
@@ -1533,8 +1696,16 @@ code,
   .export-progress-meta {
     flex-direction: column;
   }
+  .token-usage-grid {
+    grid-template-columns: 1fr;
+  }
   .dialog-actions button,
+  .token-summary-actions-right,
+  .token-summary-actions-right button,
   .status-banner .filter-actions {
     width: 100%;
+  }
+  .token-summary-actions-right {
+    flex-direction: column;
   }
 }
